@@ -326,6 +326,12 @@ checkbox-row{display:block;margin:4px 0}
 .cond-idx{font-size:11px;color:#999;width:24px;flex:0 0 auto;text-align:center}
 .dest-path{font-size:11px;color:#2e7d32;word-break:break-all}
 .hl{background:#fff9c4;padding:0 2px;border-radius:2px}
+
+/* 详情弹窗: 默认隐藏(#detail-modal 没有 .show 时不显示) */
+#detail-modal{position:fixed;inset:0;background:rgba(0,0,0,.5);
+  z-index:200;display:none;align-items:center;justify-content:center}
+#detail-modal.show{display:flex}
+#detail-modal>.card{width:90%;max-width:500px;max-height:80vh;overflow-y:auto}
 </style>
 </head>
 <body>
@@ -477,9 +483,9 @@ checkbox-row{display:block;margin:4px 0}
 
 </div>
 
-<!-- 详情弹窗 -->
-<div id="detail-modal" class="hidden" style="position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:200;display:flex;align-items:center;justify-content:center">
-  <div class="card" style="width:90%;max-width:500px;max-height:80vh;overflow-y:auto">
+<!-- 详情弹窗(默认隐藏, 点文件名才弹出) -->
+<div id="detail-modal" onclick="if(event.target===this)closeDetail()">
+  <div class="card">
     <div class="row" style="justify-content:space-between">
       <b>详情</b>
       <button class="outline" onclick="closeDetail()">关闭</button>
@@ -610,10 +616,10 @@ function showDetail(name){
       }
     }
     el.innerHTML=html;
-    document.getElementById('detail-modal').style.display='flex';
+    document.getElementById('detail-modal').classList.add('show');
   });
 }
-function closeDetail(){document.getElementById('detail-modal').style.display='none'}
+function closeDetail(){document.getElementById('detail-modal').classList.remove('show')}
 
 // ---- 分类: 条件行 ----
 const CLS_FIELDS=[['artist','作者'],['group_name','社团'],['parody','原作'],
