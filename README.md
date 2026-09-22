@@ -1,0 +1,91 @@
+# 漫画管理 APP
+
+漫画压缩包元数据管理界面。纯 Python 标准库 + HTML,手机浏览器访问,
+不需要任何前端框架(之前用 Flet 1.0 试过,Flutter Web 引擎在手机浏览器上起不来)。
+
+## 文件
+
+| 文件 | 作用 |
+|---|---|
+| `scanner.py` | 核心库: 扫描目录、解析 zip 内元数据、SQLite、多条件查询 |
+| `fileops.py` | 核心库: 移动/复制 + 大小校验 + 按字段分目录 |
+| `app.py` | HTTP 服务 + 网页界面 |
+| `plugin_loader.py` | 插件加载器 |
+| `plugins/*.py` | 插件 |
+| `test_core.py` | 核心库测试(74 项) |
+
+## 运行
+
+```bash
+bash <项目目录>/start.sh
+# 手机浏览器打开 http://127.0.0.1:8951
+# 或局域网: http://<手机IP>:8951
+```
+
+环境变量: `MANGA_DB`(默认 manga.db)、`MANGA_PORT`(默认 8951)。
+
+命令行直接用核心库(不开界面):
+
+```bash
+python3 scanner.py --dir /storage/emulated/0/Download --db manga.db
+python3 test_core.py
+```
+
+## 页面
+
+1. **扫描**: 目录/库路径可改,跑扫描,实时日志,可停止。增量: 上次成功
+   且有元数据且 size+mtime 未变才跳过;无元数据的下次重读(等下载器后补)。
+2. **浏览**: 字段下拉(先刷新值)或包含文本查询,表格展示,点行看全部字段。
+3. **分类**: 见下节。
+4. **统计**: 总数、语言/作者/原作分布条形图。
+
+## 分类整理
+
+四步:
+
+1. **处理哪些文件** — 填源目录 + 递归开关。只处理源目录里**且数据库里有**的
+   压缩包;库里没有的直接忽略。
+2. **筛选条件** — 可加任意多条,条件间选「并且/或者」。每条 = 字段 + 操作符
+   + 值。操作符: 等于/不等于/包含/不包含/为空/不为空。
+   可用字段: 作者、社团、原作、角色、语言、分类、标签、标题、格式。
+3. **目标位置** — 基础目录 + 「按字段建子目录」。例如基础目录填
+   `<目标目录>`、按作者分组,得到
+   `漫画分类/zmix/xxx.zip`。取不到值的放 `未分类/`。
+4. **执行** — 复制或移动。勾了「先预览」(默认)会先显示
+   **文件 → 目标路径** 对照表,确认后才真正动文件。移动前还会再弹一次确认。
+
+移动会校验目标大小一致才删源,并更新库里的 path。同名冲突自动改名不覆盖。
+
+## 插件页
+
+每个 plugins/*.py 一个页面。
+
+## 写插件
+
+往 `plugins/` 塞个 .py:
+
+```python
+NAME = "我的功能"
+def build(app):
+    # app.current_db() / app.run_bg(fn) / app.sync(fn)
+    return "html 字符串"
+```
+
+重启 `python3 app.py` 即生效。**无需编译打包。**
+(注: 插件系统目前还是 Flet 时代的接口,纯 HTML 版用的是内置统计页,
+要加新页面直接改 `app.py` 里的 HTML 和 API 更快。)
+
+## 支持的元数据格式
+
+zip 内: `ComicInfo.xml` / `info.json` / `meta.json` / `metadata.json`。
+归一化优先级 info > meta > metadata > xml。
+原文全部存库(archives 表四个原文列),归一化字段在 meta 表,
+ComicInfo 其余标签存 `other_fields` JSON 列。
+rar/7z 只统计不解析。
+
+## 数据库
+
+`archives(name 唯一键, path, size, mtime, 原文×4, extra_json, has_meta, error...)`
+`meta(archive_id 主键, title, artist, group_name, parody, character, tags,
+language, category, page_count, source_url, source_gid, year/month/day,
+translated, format, other_fields)`
