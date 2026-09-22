@@ -31,7 +31,10 @@ def _unique_dest(dest):
 def _copy_verified(src, dest_dir, log=print):
     """复制到 dest_dir 并校验大小,不删源。返回 (成功?, 目标路径或错误)。
 
-    目标目录不存在则创建;同名冲突自动改名不覆盖;失败时清理半成品。
+    目标目录不存在则创建。
+    目标已存在同名文件 -> 跳过(不改名、不覆盖), 返回特殊标记供调用方识别。
+    失败时清理半成品。
+    返回 (False, "SKIP:...") 表示跳过而非失败。
     """
     name = os.path.basename(src)
     if not os.path.isfile(src):
@@ -40,7 +43,10 @@ def _copy_verified(src, dest_dir, log=print):
         os.makedirs(dest_dir, exist_ok=True)
     except OSError as e:
         return False, f"建目录失败 {dest_dir}: {e}"
-    dest = _unique_dest(os.path.join(dest_dir, name))
+    dest = os.path.join(dest_dir, name)
+    if os.path.exists(dest):
+        # 目标已有同名文件: 跳过, 不产生 (1)(2) 副本, 也不覆盖
+        return False, f"SKIP:目标已存在 {dest}"
     src_size = os.path.getsize(src)
     try:
         shutil.copy2(src, dest)
@@ -65,9 +71,11 @@ def _copy_verified(src, dest_dir, log=print):
 
 
 def transfer_one(src, dest_dir, mode="copy", log=print):
-    """移动/复制单个文件到单个目录。返回 (成功?, 目标路径或错误)。
+    """移动/复制单个文件到单个目录。返回 (成功?, 目标路径或错误/跳过)。
 
     mode: copy | move
+    目标已存在同名文件时跳过(不改名不覆盖), 返回 "SKIP:..." 消息 ——
+    跳过时移动模式也不会删源文件。
     完成后校验目标大小与源一致,移动模式校验通过才删源。
     """
     ok, msg = _copy_verified(src, dest_dir, log)
@@ -232,8 +240,9 @@ def transfer_by_names(db_path, names, dest_dir, mode="copy", log=print,
                          group_dir)
     plan_by_name = {p["name"]: p for p in plan}
 
-    ok = fail = 0
+    ok = fail = skip = 0
     errors = {}
+    skipped = {}
     moved_paths = {}
     total = len(names)
     for i, n in enumerate(names, 1):
@@ -268,12 +277,16 @@ def transfer_by_names(db_path, names, dest_dir, mode="copy", log=print,
         # 扇出: 先把除第一个外的目标都复制出来,再搬第一个(移动模式下删源)。
         # 顺序不可颠倒 —— 先移动会把源搬走,后面的副本就没源可读了。
         copy_failed = None
+        skipped_n = 0
         for t in targets[1:]:
             try:
                 cok, cmsg = _copy_verified(src, t, log)
             except Exception as e:
                 cok, cmsg = False, f"{type(e).__name__}: {e}"
             if not cok:
+                if cmsg.startswith("SKIP:"):
+                    skipped_n += 1
+                    continue          # 这个目标已有同名文件, 跳过它
                 copy_failed = f"副本 {t} 失败: {cmsg}"
                 break
         if copy_failed:
@@ -292,7 +305,14 @@ def transfer_by_names(db_path, names, dest_dir, mode="copy", log=print,
             ok += 1
             moved_paths[n] = msg  # msg=新路径
             if len(targets) > 1:
-                log(f"  ✓ {n[:60]} -> {len(targets)} 个目录")
+                extra = f" (另 {skipped_n} 个目录已存在,跳过)" if skipped_n else ""
+                log(f"  ✓ {n[:60]} -> {len(targets)} 个目录{extra}")
+        elif isinstance(msg, str) and msg.startswith("SKIP:"):
+            # 目标已有同名文件: 跳过。跳过不算失败, 也不删源(移动模式下安全)
+            skip += 1
+            skipped[n] = msg[5:]
+            errors[n] = msg[5:]      # 也放进 errors, 界面统一显示原因
+            log(f"  - {n[:70]}: {msg[5:]}")
         else:
             fail += 1
             errors[n] = msg
@@ -312,6 +332,7 @@ def transfer_by_names(db_path, names, dest_dir, mode="copy", log=print,
         finally:
             conn.close()
 
-    log(f"完成: 成功 {ok},失败 {fail},目标 {dest_dir}")
-    return {"ok": ok, "fail": fail, "total": total, "mode": mode,
-            "dest": dest_dir}, errors
+    msg_tail = f",跳过 {skip}" if skip else ""
+    log(f"完成: 成功 {ok},失败 {fail}{msg_tail},目标 {dest_dir}")
+    return {"ok": ok, "fail": fail, "skip": skip, "total": total,
+            "mode": mode, "dest": dest_dir}, errors

@@ -973,7 +973,8 @@ function pollCls(){
         if(d.result){
           const r=d.result;
           document.getElementById('cls-count').textContent=
-            '完成: '+(r.ok||0)+' 成功, '+(r.fail||0)+' 失败';
+            '完成: '+(r.ok||0)+' 成功, '+(r.fail||0)+' 失败'+
+            ((r.skip||0)?(', '+(r.skip)+' 已存在被跳过'):'');
           previewNames=null;lastPlan=null;   // 执行完要重新预览
           if(r.fail&&d.errors){
             const es=Object.entries(d.errors).slice(0,5)
