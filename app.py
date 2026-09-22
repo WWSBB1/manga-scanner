@@ -173,7 +173,7 @@ class API:
 
     @staticmethod
     def filter_preview(conditions, join, base_dir, group_by, src_dir=None,
-                       recursive=False, limit=5000):
+                       recursive=False, limit=5000, group_dir=False):
         """按条件算出条目 + 目标路径,不碰文件。
 
         条目级: 一个作品的多值字段会展开成多个条目, 每个条目独立判断,
@@ -194,7 +194,7 @@ class API:
                     by_name[e["name"]].append(e["value"])
             names = list(by_name)
             plan = fileops.plan_transfer(DB_PATH, names, base_dir, group_by,
-                                         entries=by_name)
+                                         entries=by_name, group_dir=group_dir)
             # 预览按条目展开: 一个作品多个值就是多行
             rows = []
             for p in plan:
@@ -213,7 +213,8 @@ class API:
 
     @staticmethod
     def classify_go(names, dest, mode, group_by="", src_dir=None,
-                    recursive=False, conditions=None, join="and"):
+                    recursive=False, conditions=None, join="and",
+                    group_dir=False):
         cid = f"cls_{int(time.time())}"
         w = {"running": True, "stop": False, "log": [], "result": None}
         CLS_WORKERS[cid] = w
@@ -244,7 +245,7 @@ class API:
                     DB_PATH, use_names, dest, mode,
                     log=log_fn, progress=progress,
                     stop_flag=lambda: w["stop"], group_by=group_by,
-                    entries=by_name)
+                    entries=by_name, group_dir=group_dir)
                 w["result"] = result
                 w["errors"] = errs
             except Exception as ex:
@@ -523,17 +524,21 @@ checkbox-row{display:block;margin:4px 0}
   <input type="text" id="cls-dest" value="/storage/emulated/0/Download"
          oninput="destTouched=true">
   <label style="display:block;margin-top:8px;font-size:12px;color:#666">按字段建子目录</label>
-  <select id="cls-groupby">
+  <select id="cls-groupby" onchange="updateDestHint()">
     <option value="artist">按作者</option>
     <option value="parody">按原作</option>
     <option value="group_name">按社团</option>
     <option value="language">按语言</option>
     <option value="character">按角色</option>
+    <option value="tags">按标签</option>
     <option value="category">按分类</option>
+    <option value="format">按格式</option>
   </select>
-  <div style="font-size:11px;color:#888;margin-top:4px">
-    结果: 基础目录/字段值/文件.zip,取不到值的放「未分类」
-  </div>
+  <label style="display:block;margin-top:8px">
+    <input type="checkbox" id="cls-groupdir" onchange="updateDestHint()" checked>
+    多包一层字段名文件夹
+  </label>
+  <div style="font-size:11px;color:#888;margin-top:4px" id="cls-dest-hint"></div>
 </div>
 
 <div class="card">
@@ -633,6 +638,12 @@ checkbox-row{display:block;margin:4px 0}
 
 <script>
 let scanId=null, clsId=null, pollTimer=null, clsPollTimer=null;
+
+// 字段名 -> 中文(统计页和分类页共用)
+const FIELD_CN_STAT={artist:'作者',group_name:'社团',parody:'原作',
+  character:'角色',tags:'标签',language:'语言',category:'分类',
+  format:'格式',title:'标题',title_original:'原标题',page_count:'页数',
+  translated:'翻译',year:'年',source_gid:'来源ID',other_fields:'其它字段'};
 
 function showPage(p){
   document.querySelectorAll('.page').forEach(e=>e.classList.add('hidden'));
@@ -786,11 +797,23 @@ const CLS_OPS=[['eq','等于'],['ne','不等于'],['contains','包含'],
   ['count_eq','= (作品数)'],['count_gte','>= (作品数)'],['count_lte','<= (作品数)']];
 let condSeq=0, previewNames=null, lastPlan=null, destTouched=false;
 
+// 目标路径提示: 跟着字段和"包一层"开关变
+function updateDestHint(){
+  const gb=document.getElementById('cls-groupby').value;
+  const gd=document.getElementById('cls-groupdir').checked;
+  const cn=FIELD_CN_STAT[gb]||gb;
+  const base=document.getElementById('cls-dest').value.trim()||'基础目录';
+  const path=gd ? base+'/'+cn+'/<'+cn+'值>/文件.zip'
+                : base+'/<'+cn+'值>/文件.zip';
+  document.getElementById('cls-dest-hint').textContent=
+    '结果: '+path+',取不到值的放「未分类」';
+}
 // 目标基础目录默认跟随源目录; 用户手动改过就不再自动跟随
 function syncDest(){
   if(destTouched)return;
   const s=document.getElementById('cls-src').value.trim();
   if(s)document.getElementById('cls-dest').value=s;
+  updateDestHint();
 }
 
 function addCond(field,op,value){
@@ -840,6 +863,7 @@ function collectConds(){
   return out;
 }
 addCond();
+updateDestHint();
 
 // ---- 分类: 预览与执行 ----
 function clsPayload(){
@@ -848,6 +872,7 @@ function clsPayload(){
     join:document.getElementById('cls-join').value,
     base_dir:document.getElementById('cls-dest').value.trim(),
     group_by:document.getElementById('cls-groupby').value||'artist',
+    group_dir:document.getElementById('cls-groupdir').checked,
     src_dir:document.getElementById('cls-src').value.trim()||null,
     recursive:document.getElementById('cls-recursive').checked,
     mode:document.querySelector('input[name=mode]:checked').value
@@ -917,7 +942,7 @@ function doClassify(){
   }
   fetch('/api/classify',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({dest:p.base_dir,mode:p.mode,group_by:p.group_by,
-      src_dir:p.src_dir,recursive:p.recursive,
+      src_dir:p.src_dir,recursive:p.recursive,group_dir:p.group_dir,
       conditions:p.conditions,join:p.join})})
     .then(r=>r.json()).then(d=>{
       if(d.error){alert('执行失败: '+d.error);return;}
@@ -964,10 +989,6 @@ function pollCls(){
 // ---- 统计 ----
 let statField=null, statShown=0, statTotal=0, statTimer=null, statsLoaded=false;
 const STAT_PAGE=20, STAT_STEP=100;
-const FIELD_CN_STAT={artist:'作者',group_name:'社团',parody:'原作',
-  character:'角色',tags:'标签',language:'语言',category:'分类',
-  format:'格式',title:'标题',title_original:'原标题',page_count:'页数',
-  translated:'翻译',year:'年',source_gid:'来源ID',other_fields:'其它字段'};
 
 function loadStats(){
   statsLoaded=true;
@@ -1223,6 +1244,7 @@ class Handler(BaseHTTPRequestHandler):
             recursive = body.get("recursive", False)
             conditions = body.get("conditions", [])
             join = body.get("join", "and")
+            group_dir = body.get("group_dir", False)
             if not dest:
                 self._json({"error": "缺少目标目录"})
                 return
@@ -1230,7 +1252,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "请选择按哪个字段建子目录"})
                 return
             self._json(API.classify_go(names, dest, mode, group_by,
-                                       src_dir, recursive, conditions, join))
+                                       src_dir, recursive, conditions, join,
+                                       group_dir))
             return
         if path == "/api/preview":
             conditions = body.get("conditions", [])
@@ -1239,6 +1262,7 @@ class Handler(BaseHTTPRequestHandler):
             group_by = body.get("group_by", "")
             src_dir = body.get("src_dir") or None
             recursive = body.get("recursive", False)
+            group_dir = body.get("group_dir", False)
             if not base_dir:
                 self._json({"error": "请填目标基础目录"})
                 return
@@ -1246,7 +1270,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "请选择按哪个字段建子目录"})
                 return
             self._json(API.filter_preview(conditions, join, base_dir,
-                                          group_by, src_dir, recursive))
+                                          group_by, src_dir, recursive,
+                                          group_dir=group_dir))
             return
         if path == "/api/source":
             src_dir = body.get("src_dir", "")

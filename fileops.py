@@ -102,14 +102,25 @@ def _load_rows(db_path, names):
     return [dict(zip(cols, r)) for r in rows]
 
 
+# 字段名 -> 建出来的中间层目录名
+GROUP_DIR_CN = {
+    "artist": "作者", "group_name": "社团", "parody": "原作",
+    "character": "角色", "tags": "标签", "language": "语言",
+    "category": "分类", "format": "格式",
+}
+
+
 def plan_transfer(db_path, names, base_dir, group_by="", mode="copy",
-                  entries=None):
+                  entries=None, group_dir=False):
     """生成搬移计划(不碰文件),供预览和执行共用。
 
     多值字段会扇出: 一个作品在该字段有多个值就有多个目标目录。
-    entries: {name: [值, ...]},由筛选结果决定要进哪些值目录。
-             不给(None)时沿用旧行为: 从 meta 读出该字段的全部值。
-             值为空列表表示该作品没有保留任何值 -> 不产生目标。
+    entries:   {name: [值, ...]},由筛选结果决定要进哪些值目录。
+               不给(None)时沿用旧行为: 从 meta 读出该字段的全部值。
+               值为空列表表示该作品没有保留任何值 -> 不产生目标。
+    group_dir: True 时多包一层以字段命名的目录:
+               基础目录/作者/zmix/x.zip 而不是 基础目录/zmix/x.zip。
+               不同分类维度的结果就不会混在一起。
     返回 [{name, src, targets:[目录...], dest_dir, dest, exists_src, error}]
     dest_dir / dest 是第一个目标; targets 为空时两者都是 None。
     """
@@ -131,12 +142,17 @@ def plan_transfer(db_path, names, base_dir, group_by="", mode="copy",
                 vals = scanner.split_values(r.get(group_by))
             # 筛选结果([] 也是有效结果)不套用"未分类"兜底; 旧行为才兜底
             vals = vals[:limit] or ([] if entries is not None else ["未分类"])
+            # 包一层字段名目录(如 作者/、标签/)
+            root = base_dir
+            if group_dir:
+                root = os.path.join(base_dir,
+                                    GROUP_DIR_CN.get(group_by, group_by))
             subs = []
             for v in vals:
                 s = scanner.group_subdir({group_by: v}, group_by)
                 if s not in subs:
                     subs.append(s)
-            targets = [os.path.join(base_dir, s) for s in subs]
+            targets = [os.path.join(root, s) for s in subs]
         else:
             targets = [base_dir]
         first = targets[0] if targets else None
@@ -198,19 +214,22 @@ def match_in_db(db_path, src_dir, recursive=True):
 
 
 def transfer_by_names(db_path, names, dest_dir, mode="copy", log=print,
-                      progress=None, stop_flag=None, group_by="", entries=None):
+                      progress=None, stop_flag=None, group_by="", entries=None,
+                      group_dir=False):
     """按文件名列表批量移动/复制。
 
     names:    archives.name 的列表
     dest_dir: 基础目标目录
     group_by: 按该字段建子目录(空串则全放 dest_dir)
     entries:  {name: [值, ...]},由筛选结果决定要进哪些值目录(见 plan_transfer)
+    group_dir: True 时多包一层字段名目录(基础目录/作者/值/文件)
     移动成功后把库里的 path 更新为新位置,让后续扫描不误判"同名冲突"。
     返回 {结果统计}, {name: 消息} 失败清单
     """
     if mode not in ("copy", "move"):
         raise ValueError(f"mode 必须是 copy/move: {mode}")
-    plan = plan_transfer(db_path, names, dest_dir, group_by, mode, entries)
+    plan = plan_transfer(db_path, names, dest_dir, group_by, mode, entries,
+                         group_dir)
     plan_by_name = {p["name"]: p for p in plan}
 
     ok = fail = 0
