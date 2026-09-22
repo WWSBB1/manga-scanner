@@ -658,8 +658,49 @@ VALID_FIELDS = set(META_COLUMNS) | {"language", "category"}
 VALID_OPS = {
     "eq": "等于", "ne": "不等于", "contains": "包含",
     "not_contains": "不包含", "empty": "为空", "not_empty": "不为空",
+    "count_gte": "数量>=", "count_lte": "数量<=",
 }
 VALID_JOINS = ("and", "or")
+
+# 数量类操作符(需要先按字段分组计数)
+COUNT_OPS = ("count_gte", "count_lte")
+
+
+def _to_int(v, what="阈值"):
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"非法{what}: {v!r}")
+
+
+def count_groups(db_path, field, min_count=0, max_count=0,
+                 base_conditions=None, join="and"):
+    """按字段的拆分值分组计数,返回作品数达标的值列表。
+
+    base_conditions: 先按这些条件圈定候选作品(数量条件与它们取交集)
+    min_count / max_count: 0 表示不限;两个都是 0 时至少要求 1 个作品
+    """
+    if field not in VALID_FIELDS:
+        raise ValueError(f"非法字段: {field}")
+    lo = _to_int(min_count, "下限") if min_count else 1
+    hi = _to_int(max_count, "上限") if max_count else 0
+    where, args = build_where(base_conditions or [], join)
+    conn = sqlite3.connect(db_path)
+    try:
+        sql = ("SELECT mv.value, COUNT(DISTINCT mv.archive_id) c "
+               "FROM meta_values mv JOIN archives a ON a.id=mv.archive_id "
+               f"WHERE mv.field=? AND ({where}) "
+               "GROUP BY mv.value")
+        params = [field] + list(args)
+        if hi:
+            sql += " HAVING c >= ? AND c <= ?"
+            params += [lo, hi]
+        else:
+            sql += " HAVING c >= ?"
+            params += [lo]
+        return [r[0] for r in conn.execute(sql, params)]
+    finally:
+        conn.close()
 
 
 def build_where(conditions, join="and"):
@@ -723,8 +764,40 @@ def build_where(conditions, join="and"):
 
 
 def query_archives(db_path=DEFAULT_DB, conditions=None, join="and", limit=2000):
-    """按多条件查询,返回 (cols, rows)。"""
-    where, args = build_where(conditions or [], join)
+    """按多条件查询,返回 (cols, rows)。
+
+    数量类条件(count_gte / count_lte)先分组计数算出达标的值,
+    再把这些值当成等值条件并入查询。多个数量条件各自独立运算,
+    结果取交集(与其他条件一致)。
+    """
+    conditions = list(conditions or [])
+    normal = [c for c in conditions if (c.get("op") or "eq") not in COUNT_OPS]
+    counts = [c for c in conditions if (c.get("op") or "eq") in COUNT_OPS]
+    if not counts:
+        where, args = build_where(normal, join)
+        return list_archives(db_path, where, args, limit)
+
+    # 每个数量条件: 在"其他条件"命中的范围内分组计数
+    extras = []
+    for c in counts:
+        v = _to_int(c.get("value") or 0)
+        lo = v if c.get("op") == "count_gte" else 0
+        hi = v if c.get("op") == "count_lte" else 0
+        vals = count_groups(db_path, c["field"], min_count=lo, max_count=hi,
+                            base_conditions=normal, join=join)
+        if not vals:
+            return list_archives(db_path, "1=0", [], limit)
+        extras.append((c["field"], vals))
+
+    where, args = build_where(normal, join)
+    args = list(args)
+    for field, vals in extras:
+        ph = ",".join("?" * len(vals))
+        block = ("EXISTS (SELECT 1 FROM meta_values mv "
+                 "WHERE mv.archive_id=a.id AND mv.field=? "
+                 f"AND mv.value IN ({ph}))")
+        where = f"({where}) AND {block}"
+        args += [field] + vals
     return list_archives(db_path, where, args, limit)
 
 
