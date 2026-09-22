@@ -394,7 +394,8 @@ checkbox-row{display:block;margin:4px 0}
   <b>1. 处理哪些文件</b>
   <div style="margin-top:8px">
     <label style="font-size:12px;color:#666">源目录 (只处理这里的文件,库里没有的忽略)</label>
-    <input type="text" id="cls-src" value="/storage/emulated/0/Download">
+    <input type="text" id="cls-src" value="/storage/emulated/0/Download"
+           oninput="syncDest()">
     <label style="display:block;margin-top:6px">
       <input type="checkbox" id="cls-recursive"> 递归子目录
     </label>
@@ -416,10 +417,10 @@ checkbox-row{display:block;margin:4px 0}
 <div class="card">
   <b>3. 目标位置</b>
   <label style="display:block;margin-top:8px;font-size:12px;color:#666">基础目录</label>
-  <input type="text" id="cls-dest" value="<目标目录>">
+  <input type="text" id="cls-dest" value="/storage/emulated/0/Download"
+         oninput="destTouched=true">
   <label style="display:block;margin-top:8px;font-size:12px;color:#666">按字段建子目录</label>
   <select id="cls-groupby">
-    <option value="">不建子目录</option>
     <option value="artist">按作者</option>
     <option value="parody">按原作</option>
     <option value="group_name">按社团</option>
@@ -428,7 +429,7 @@ checkbox-row{display:block;margin:4px 0}
     <option value="category">按分类</option>
   </select>
   <div style="font-size:11px;color:#888;margin-top:4px">
-    例: 基础目录/作者名/文件.zip,取不到值的放「未分类」
+    结果: 基础目录/字段值/文件.zip,取不到值的放「未分类」
   </div>
 </div>
 
@@ -620,8 +621,15 @@ const CLS_FIELDS=[['artist','作者'],['group_name','社团'],['parody','原作'
   ['tags','标签'],['title','标题'],['format','格式']];
 const CLS_OPS=[['eq','等于'],['ne','不等于'],['contains','包含'],
   ['not_contains','不包含'],['empty','为空'],['not_empty','不为空'],
-  ['count_gte','数量>='],['count_lte','数量<=']];
-let condSeq=0, previewNames=null, lastPlan=null;
+  ['count_gte','>='],['count_lte','<=']];
+let condSeq=0, previewNames=null, lastPlan=null, destTouched=false;
+
+// 目标基础目录默认跟随源目录; 用户手动改过就不再自动跟随
+function syncDest(){
+  if(destTouched)return;
+  const s=document.getElementById('cls-src').value.trim();
+  if(s)document.getElementById('cls-dest').value=s;
+}
 
 function addCond(field,op,value){
   const id=++condSeq;
@@ -677,7 +685,7 @@ function clsPayload(){
     conditions:collectConds(),
     join:document.getElementById('cls-join').value,
     base_dir:document.getElementById('cls-dest').value.trim(),
-    group_by:document.getElementById('cls-groupby').value,
+    group_by:document.getElementById('cls-groupby').value||'artist',
     src_dir:document.getElementById('cls-src').value.trim()||null,
     recursive:document.getElementById('cls-recursive').checked,
     mode:document.querySelector('input[name=mode]:checked').value
@@ -937,6 +945,9 @@ class Handler(BaseHTTPRequestHandler):
             if not names or not dest:
                 self._json({"error": "缺少参数"})
                 return
+            if not group_by:
+                self._json({"error": "请选择按哪个字段建子目录"})
+                return
             self._json(API.classify_go(names, dest, mode, group_by,
                                        src_dir, recursive))
             return
@@ -949,6 +960,9 @@ class Handler(BaseHTTPRequestHandler):
             recursive = body.get("recursive", False)
             if not base_dir:
                 self._json({"error": "请填目标基础目录"})
+                return
+            if not group_by:
+                self._json({"error": "请选择按哪个字段建子目录"})
                 return
             self._json(API.filter_preview(conditions, join, base_dir,
                                           group_by, src_dir, recursive))
