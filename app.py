@@ -156,21 +156,39 @@ class API:
 
     @staticmethod
     def filter_preview(conditions, join, base_dir, group_by, src_dir=None,
-                       recursive=False, limit=2000):
-        """按条件算出匹配的文件 + 目标路径,不碰文件。"""
+                       recursive=False, limit=5000):
+        """按条件算出条目 + 目标路径,不碰文件。
+
+        条目级: 一个作品的多值字段会展开成多个条目, 每个条目独立判断,
+        筛选后剩下的值直接决定分类目录。
+        """
         try:
-            cols, rows = scanner.query_archives(DB_PATH, conditions, join, limit)
-            matched = [dict(zip(cols, r)) for r in rows]
-            names = [r["name"] for r in matched]
+            entries = scanner.query_entries(DB_PATH, conditions, join,
+                                            fields=[group_by], limit=limit)
             if src_dir:
-                # 限定在源目录内(且库里必须有)
                 allowed = {i["name"] for i in
                            fileops.match_in_db(DB_PATH, src_dir, recursive)}
-                names = [n for n in names if n in allowed]
-                matched = [r for r in matched if r["name"] in allowed]
-            plan = fileops.plan_transfer(DB_PATH, names, base_dir, group_by)
-            return {"plan": plan, "count": len(plan),
-                    "matched_total": len(matched),
+                entries = [e for e in entries if e["name"] in allowed]
+            # 按作品聚合成 {name: [值...]}
+            by_name = {}
+            for e in entries:
+                by_name.setdefault(e["name"], [])
+                if e["value"] not in by_name[e["name"]]:
+                    by_name[e["name"]].append(e["value"])
+            names = list(by_name)
+            plan = fileops.plan_transfer(DB_PATH, names, base_dir, group_by,
+                                         entries=by_name)
+            # 预览按条目展开: 一个作品多个值就是多行
+            rows = []
+            for p in plan:
+                for t in p["targets"]:
+                    rows.append({"name": p["name"], "src": p["src"],
+                                 "dest_dir": t,
+                                 "dest": os.path.join(t, p["name"]),
+                                 "targets": p["targets"],
+                                 "exists_src": p["exists_src"]})
+            return {"plan": plan, "rows": rows, "count": len(plan),
+                    "entry_count": len(rows),
                     "missing": [p["name"] for p in plan
                                 if not p.get("exists_src")]}
         except Exception as ex:
@@ -178,7 +196,7 @@ class API:
 
     @staticmethod
     def classify_go(names, dest, mode, group_by="", src_dir=None,
-                    recursive=False):
+                    recursive=False, conditions=None, join="and"):
         cid = f"cls_{int(time.time())}"
         w = {"running": True, "stop": False, "log": [], "result": None}
         CLS_WORKERS[cid] = w
@@ -191,18 +209,25 @@ class API:
 
         def worker():
             try:
-                use_names = names
+                entries = scanner.query_entries(
+                    DB_PATH, conditions or [], join, fields=[group_by])
                 if src_dir:
                     allowed = {i["name"] for i in
                                fileops.match_in_db(DB_PATH, src_dir, recursive)}
-                    use_names = [n for n in names if n in allowed]
-                    skipped = len(names) - len(use_names)
-                    if skipped:
-                        log_fn(f"跳过 {skipped} 个不在源目录/库中的文件")
+                    entries = [e for e in entries if e["name"] in allowed]
+                by_name = {}
+                for e in entries:
+                    by_name.setdefault(e["name"], [])
+                    if e["value"] not in by_name[e["name"]]:
+                        by_name[e["name"]].append(e["value"])
+                use_names = list(by_name)
+                if not use_names:
+                    log_fn("筛选后没有任何条目, 无事可做")
                 result, errs = fileops.transfer_by_names(
                     DB_PATH, use_names, dest, mode,
                     log=log_fn, progress=progress,
-                    stop_flag=lambda: w["stop"], group_by=group_by)
+                    stop_flag=lambda: w["stop"], group_by=group_by,
+                    entries=by_name)
                 w["result"] = result
                 w["errors"] = errs
             except Exception as ex:
@@ -746,13 +771,12 @@ function doClassify(){
   if(document.getElementById('cls-preview').checked&&!previewNames){
     doPreview();return;
   }
-  const names=previewNames;
-  if(!names||!names.length){alert('没有要处理的文件,先预览一下');return;}
-  // 移动是不可逆的: 说明会生成几份,并明确原文件会被删
-  let fanout=names.length;
-  if(lastPlan){
-    fanout=lastPlan.reduce((s,x)=>s+((x.targets&&x.targets.length)||1),0);
+  if(!lastPlan||!lastPlan.length){
+    alert('没有要处理的文件,先预览一下');return;
   }
+  const names=lastPlan.map(x=>x.name);
+  // 移动是不可逆的: 说明会生成几份,并明确原文件会被删
+  let fanout=lastPlan.reduce((s,x)=>s+((x.targets&&x.targets.length)||1),0);
   if(p.mode=='move'){
     const extra=fanout>names.length
       ? '\n有多个作者/角色/标签的作品会在每个目录各放一份副本(共 '+fanout+' 份)。'
@@ -761,8 +785,9 @@ function doClassify(){
         '\n原位置的文件会被删除,此操作不可撤销。'))return;
   }
   fetch('/api/classify',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({names,dest:p.base_dir,mode:p.mode,
-      group_by:p.group_by,src_dir:p.src_dir,recursive:p.recursive})})
+    body:JSON.stringify({dest:p.base_dir,mode:p.mode,group_by:p.group_by,
+      src_dir:p.src_dir,recursive:p.recursive,
+      conditions:p.conditions,join:p.join})})
     .then(r=>r.json()).then(d=>{
       if(d.error){alert('执行失败: '+d.error);return;}
       clsId=d.cls_id;
@@ -948,14 +973,16 @@ class Handler(BaseHTTPRequestHandler):
             group_by = body.get("group_by", "")
             src_dir = body.get("src_dir") or None
             recursive = body.get("recursive", False)
-            if not names or not dest:
-                self._json({"error": "缺少参数"})
+            conditions = body.get("conditions", [])
+            join = body.get("join", "and")
+            if not dest:
+                self._json({"error": "缺少目标目录"})
                 return
             if not group_by:
                 self._json({"error": "请选择按哪个字段建子目录"})
                 return
             self._json(API.classify_go(names, dest, mode, group_by,
-                                       src_dir, recursive))
+                                       src_dir, recursive, conditions, join))
             return
         if path == "/api/preview":
             conditions = body.get("conditions", [])
