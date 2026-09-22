@@ -621,7 +621,7 @@ const CLS_FIELDS=[['artist','作者'],['group_name','社团'],['parody','原作'
   ['tags','标签'],['title','标题'],['format','格式']];
 const CLS_OPS=[['eq','等于'],['ne','不等于'],['contains','包含'],
   ['not_contains','不包含'],['empty','为空'],['not_empty','不为空'],
-  ['count_gte','>='],['count_lte','<=']];
+  ['count_eq','= (作品数)'],['count_gte','>= (作品数)'],['count_lte','<= (作品数)']];
 let condSeq=0, previewNames=null, lastPlan=null, destTouched=false;
 
 // 目标基础目录默认跟随源目录; 用户手动改过就不再自动跟随

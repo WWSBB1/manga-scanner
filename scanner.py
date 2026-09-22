@@ -658,12 +658,12 @@ VALID_FIELDS = set(META_COLUMNS) | {"language", "category"}
 VALID_OPS = {
     "eq": "等于", "ne": "不等于", "contains": "包含",
     "not_contains": "不包含", "empty": "为空", "not_empty": "不为空",
-    "count_gte": "数量>=", "count_lte": "数量<=",
+    "count_eq": "=", "count_gte": ">=", "count_lte": "<=",
 }
 VALID_JOINS = ("and", "or")
 
 # 数量类操作符(需要先按字段分组计数)
-COUNT_OPS = ("count_gte", "count_lte")
+COUNT_OPS = ("count_eq", "count_gte", "count_lte")
 
 
 def _to_int(v, what="阈值"):
@@ -785,8 +785,13 @@ def query_archives(db_path=DEFAULT_DB, conditions=None, join="and", limit=2000):
     extras = []
     for c in counts:
         v = _to_int(c.get("value") or 0)
-        lo = v if c.get("op") == "count_gte" else 0
-        hi = v if c.get("op") == "count_lte" else 0
+        op = c.get("op")
+        if op == "count_eq":
+            lo = hi = v
+        elif op == "count_gte":
+            lo, hi = v, 0
+        else:                       # count_lte
+            lo, hi = 0, v
         vals = count_groups(db_path, c["field"], min_count=lo, max_count=hi)
         if not vals:
             # 这个数量条件没有任何达标值, 单独看它是空集
