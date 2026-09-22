@@ -102,12 +102,16 @@ def _load_rows(db_path, names):
     return [dict(zip(cols, r)) for r in rows]
 
 
-def plan_transfer(db_path, names, base_dir, group_by="", mode="copy"):
+def plan_transfer(db_path, names, base_dir, group_by="", mode="copy",
+                  entries=None):
     """生成搬移计划(不碰文件),供预览和执行共用。
 
     多值字段会扇出: 一个作品在该字段有多个值就有多个目标目录。
+    entries: {name: [值, ...]},由筛选结果决定要进哪些值目录。
+             不给(None)时沿用旧行为: 从 meta 读出该字段的全部值。
+             值为空列表表示该作品没有保留任何值 -> 不产生目标。
     返回 [{name, src, targets:[目录...], dest_dir, dest, exists_src, error}]
-    dest_dir / dest 是第一个目标,兼容只关心单目标的调用方。
+    dest_dir / dest 是第一个目标; targets 为空时两者都是 None。
     """
     rows = _load_rows(db_path, names)
     by_name = {r["name"]: r for r in rows}
@@ -121,7 +125,12 @@ def plan_transfer(db_path, names, base_dir, group_by="", mode="copy"):
                          "error": "库里查不到"})
             continue
         if group_by:
-            vals = scanner.split_values(r.get(group_by))[:limit] or ["未分类"]
+            if entries is not None:
+                vals = list(entries.get(n) or [])
+            else:
+                vals = scanner.split_values(r.get(group_by))
+            # 筛选结果([] 也是有效结果)不套用"未分类"兜底; 旧行为才兜底
+            vals = vals[:limit] or ([] if entries is not None else ["未分类"])
             subs = []
             for v in vals:
                 s = scanner.group_subdir({group_by: v}, group_by)
@@ -130,13 +139,13 @@ def plan_transfer(db_path, names, base_dir, group_by="", mode="copy"):
             targets = [os.path.join(base_dir, s) for s in subs]
         else:
             targets = [base_dir]
-        first = targets[0]
+        first = targets[0] if targets else None
         plan.append({
             "name": n,
             "src": r.get("path"),
             "targets": targets,
             "dest_dir": first,
-            "dest": os.path.join(first, n),
+            "dest": os.path.join(first, n) if first else None,
             "exists_src": os.path.isfile(r.get("path") or ""),
             "artist": r.get("artist"), "parody": r.get("parody"),
             "language": r.get("language"),
@@ -189,18 +198,19 @@ def match_in_db(db_path, src_dir, recursive=True):
 
 
 def transfer_by_names(db_path, names, dest_dir, mode="copy", log=print,
-                      progress=None, stop_flag=None, group_by=""):
+                      progress=None, stop_flag=None, group_by="", entries=None):
     """按文件名列表批量移动/复制。
 
     names:    archives.name 的列表
     dest_dir: 基础目标目录
     group_by: 按该字段建子目录(空串则全放 dest_dir)
+    entries:  {name: [值, ...]},由筛选结果决定要进哪些值目录(见 plan_transfer)
     移动成功后把库里的 path 更新为新位置,让后续扫描不误判"同名冲突"。
     返回 {结果统计}, {name: 消息} 失败清单
     """
     if mode not in ("copy", "move"):
         raise ValueError(f"mode 必须是 copy/move: {mode}")
-    plan = plan_transfer(db_path, names, dest_dir, group_by, mode)
+    plan = plan_transfer(db_path, names, dest_dir, group_by, mode, entries)
     plan_by_name = {p["name"]: p for p in plan}
 
     ok = fail = 0
@@ -215,6 +225,13 @@ def transfer_by_names(db_path, names, dest_dir, mode="copy", log=print,
         if not p or p.get("error"):
             fail += 1
             errors[n] = (p or {}).get("error", "库里查不到路径")
+            continue
+        if not p.get("targets"):
+            # 筛选后没有保留任何值 -> 这个作品不该被处理
+            errors[n] = "筛选后没有保留任何值,跳过"
+            log(f"  - {n[:70]}: 筛选后无值,跳过")
+            if progress:
+                progress(i, total)
             continue
         src = p["src"]
         if not src:
