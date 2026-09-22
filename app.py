@@ -123,7 +123,23 @@ class API:
             where, args = f"m.{field} = ?", [value]
         try:
             cols, rows = scanner.list_archives(DB_PATH, where, args, limit)
-            return {"columns": cols, "rows": rows, "count": len(rows)}
+            # 多值字段的条目数, 供前端显示 [N] 徽标
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                cnt = {}
+                for aid, f, n in conn.execute(
+                        "SELECT archive_id, field, COUNT(*) FROM meta_values "
+                        "GROUP BY archive_id, field"):
+                    cnt.setdefault(aid, {})[f] = n
+                name_to_id = dict(conn.execute("SELECT name, id FROM archives"))
+            finally:
+                conn.close()
+            counts = []
+            for r in rows:
+                d = dict(zip(cols, r))
+                counts.append(cnt.get(name_to_id.get(d.get("name")), {}))
+            return {"columns": cols, "rows": rows, "count": len(rows),
+                    "value_counts": counts}
         except Exception as ex:
             return {"error": str(ex)}
 
@@ -351,6 +367,9 @@ checkbox-row{display:block;margin:4px 0}
 .cond-idx{font-size:11px;color:#999;width:24px;flex:0 0 auto;text-align:center}
 .dest-path{font-size:11px;color:#2e7d32;word-break:break-all}
 .hl{background:#fff9c4;padding:0 2px;border-radius:2px}
+.badge.mv{cursor:pointer;background:#7e57c2}
+.vlist{margin-top:4px;line-height:1.8}
+.vlist .tag{font-size:11px}
 
 /* 详情弹窗: 默认隐藏(#detail-modal 没有 .show 时不显示) */
 #detail-modal{position:fixed;inset:0;background:rgba(0,0,0,.5);
@@ -598,17 +617,42 @@ function doQuery(){
       const tb=document.querySelector('#browse-table tbody');
       document.getElementById('browse-count').textContent=d.count+' 条';
       if(d.error){tb.innerHTML='<tr><td colspan=6>'+esc(d.error)+'</td></tr>';return;}
-      tb.innerHTML=d.rows.map(r=>{
+      tb.innerHTML=d.rows.map((r,i)=>{
         const m=cols2obj(d.columns,r);
+        const vc=(d.value_counts&&d.value_counts[i])||{};
+        // 多值字段: 显示前两个 + [N] 徽标, 点徽标展开全部
+        const cell=(f,maxLen)=>{
+          const raw=(m[f]==null?'':String(m[f]));
+          const n=vc[f]||0;
+          if(n>1){
+            const parts=raw.split(',').map(x=>x.trim()).filter(Boolean);
+            const brief=parts.slice(0,2).join(', ')+(parts.length>2?' …':'');
+            return esc(brief)+' <span class="badge mv" data-vals="'+esc(raw)+
+              '" data-n="'+n+'" onclick="event.stopPropagation();showVals(this)">'+n+'</span>';
+          }
+          return esc(raw.length>maxLen?raw.slice(0,maxLen)+'…':raw);
+        };
         return '<tr onclick="showDetail('+JSON.stringify(m.name)+')">'+
           '<td>'+esc((m.name||'').slice(0,40))+'</td>'+
-          '<td>'+esc(m.artist||'')+'</td>'+
-          '<td>'+esc(m.parody||'')+'</td>'+
+          '<td>'+cell('artist',20)+'</td>'+
+          '<td>'+cell('parody',20)+'</td>'+
           '<td>'+esc(m.language||'')+'</td>'+
           '<td>'+(m.page_count||'')+'</td>'+
-          '<td>'+esc((m.tags||'').slice(0,50))+'</td></tr>';
+          '<td>'+cell('tags',40)+'</td></tr>';
       }).join('');
     });
+}
+// 展开多值: 在徽标下方列出全部值, 再点收起
+function showVals(el){
+  const td=el.parentNode;
+  const existing=td.querySelector('.vlist');
+  if(existing){existing.remove();el.textContent=el.dataset.n;return;}
+  const vals=(el.dataset.vals||'').split(',').map(s=>s.trim()).filter(Boolean);
+  el.textContent='收起';
+  const div=document.createElement('div');
+  div.className='vlist';
+  div.innerHTML=vals.map(v=>'<span class="tag">'+esc(v)+'</span>').join('');
+  td.appendChild(div);
 }
 function cols2obj(cols,row){
   const o={};cols.forEach((c,i)=>o[c]=row[i]);return o;
