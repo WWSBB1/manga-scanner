@@ -273,37 +273,88 @@ class API:
 
     @staticmethod
     def stats():
+        """总览: 各字段的基数概览(不含明细,明细走 /api/stat_field)。"""
         try:
             conn = sqlite3.connect(DB_PATH)
             try:
                 total = conn.execute(
                     "SELECT COUNT(*) FROM archives").fetchone()[0]
                 with_meta = conn.execute(
-                    "SELECT COUNT(*) FROM archives WHERE has_meta=1").fetchone()[0]
+                    "SELECT COUNT(*) FROM archives WHERE has_meta=1"
+                    ).fetchone()[0]
                 errors = conn.execute(
                     "SELECT COUNT(*) FROM archives WHERE error IS NOT NULL"
                     ).fetchone()[0]
-                langs = conn.execute(
-                    "SELECT m.language, COUNT(*) FROM meta m "
-                    "GROUP BY 1 ORDER BY 2 DESC LIMIT 10").fetchall()
-                top_artists = conn.execute(
-                    "SELECT m.artist, COUNT(*) FROM meta m "
-                    "WHERE m.artist IS NOT NULL "
-                    "GROUP BY 1 ORDER BY 2 DESC LIMIT 15").fetchall()
-                top_parodies = conn.execute(
-                    "SELECT m.parody, COUNT(*) FROM meta m "
-                    "WHERE m.parody IS NOT NULL "
-                    "GROUP BY 1 ORDER BY 2 DESC LIMIT 10").fetchall()
+                # 各字段: 不同值个数 + 条目总数, 供字段选择器显示规模
+                fields = []
+                for f in scanner.MULTI_FIELDS:
+                    n = conn.execute(
+                        "SELECT COUNT(DISTINCT value) FROM meta_values "
+                        "WHERE field=?", (f,)).fetchone()[0]
+                    m = conn.execute(
+                        "SELECT COUNT(*) FROM meta_values WHERE field=?",
+                        (f,)).fetchone()[0]
+                    if n:
+                        fields.append({"field": f, "distinct": n,
+                                       "entries": m})
+                fields.sort(key=lambda x: -x["distinct"])
+                avg_tags = 0
+                if total:
+                    te = conn.execute(
+                        "SELECT COUNT(*) FROM meta_values WHERE field='tags'"
+                        ).fetchone()[0]
+                    avg_tags = round(te / total, 1)
             finally:
                 conn.close()
             return {"total": total, "with_meta": with_meta,
-                    "errors": errors,
-                    "langs": [{"name": l or "未知", "count": c}
-                              for l, c in langs],
-                    "artists": [{"name": a, "count": c}
-                                for a, c in top_artists],
-                    "parodies": [{"name": p, "count": c}
-                                 for p, c in top_parodies]}
+                    "errors": errors, "fields": fields,
+                    "avg_tags": avg_tags}
+        except Exception as ex:
+            return {"error": str(ex)}
+
+    @staticmethod
+    def stat_field(field, limit=20, offset=0, q="", sort="count"):
+        """某字段的分布明细, 分页 + 搜索。
+
+        limit/offset: 分页, 避免一次拉几万行
+        q:            过滤值(子串匹配)
+        sort:         count(按作品数) | name(按名称)
+        返回 top(当前页) + total_values(该字段不同值总数) +
+             tail(剩余值的数量和作品数, 用于显示"其他 N 项")
+        """
+        if field not in scanner.MULTI_FIELDS:
+            return {"error": f"非法字段: {field}"}
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                where, args = "field=?", [field]
+                if q:
+                    where += " AND value LIKE ?"
+                    args.append(f"%{q}%")
+                total_values = conn.execute(
+                    f"SELECT COUNT(DISTINCT value) FROM meta_values "
+                    f"WHERE {where}", args).fetchone()[0]
+                order = "value ASC" if sort == "name" else "c DESC, value ASC"
+                rows = conn.execute(
+                    f"SELECT value, COUNT(DISTINCT archive_id) c "
+                    f"FROM meta_values WHERE {where} GROUP BY value "
+                    f"ORDER BY {order} LIMIT ? OFFSET ?",
+                    args + [limit, offset]).fetchall()
+                # 本级之外还剩多少(长尾折叠)
+                tail = conn.execute(
+                    f"SELECT COUNT(*), COALESCE(SUM(c),0) FROM ("
+                    f"  SELECT COUNT(DISTINCT archive_id) c FROM meta_values "
+                    f"  WHERE {where} GROUP BY value "
+                    f"  ORDER BY {order} LIMIT -1 OFFSET ?)",
+                    args + [offset + limit]).fetchone()
+            finally:
+                conn.close()
+            return {"field": field,
+                    "top": [{"name": v, "count": c} for v, c in rows],
+                    "total_values": total_values,
+                    "shown": offset + len(rows),
+                    "tail_values": tail[0] if tail else 0,
+                    "tail_entries": tail[1] if tail else 0}
         except Exception as ex:
             return {"error": str(ex)}
 
@@ -521,8 +572,31 @@ checkbox-row{display:block;margin:4px 0}
 <!-- ===== 统计页 ===== -->
 <div id="page-stats" class="page hidden">
 <h2>📊 统计</h2>
-<div class="card"><button onclick="loadStats()">刷新统计</button></div>
-<div id="stats-content"></div>
+<div class="card" id="stats-overview"><button onclick="loadStats()">刷新统计</button></div>
+
+<div class="card">
+  <label style="font-size:12px;color:#666">选择字段看分布</label>
+  <div id="stats-fields" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px"></div>
+</div>
+
+<div class="card" id="stats-detail-card" style="display:none">
+  <div class="row" style="justify-content:space-between">
+    <b id="stats-detail-title">分布</b>
+    <span id="stats-detail-meta" style="font-size:12px;color:#666"></span>
+  </div>
+  <div class="row" style="margin-top:6px">
+    <input type="text" id="stats-q" placeholder="搜索值…" oninput="onStatSearch()">
+    <select id="stats-sort" onchange="loadStatField(true)" style="flex:0 0 auto">
+      <option value="count">按数量</option>
+      <option value="name">按名称</option>
+    </select>
+  </div>
+  <div id="stats-bars"></div>
+  <div class="row" style="margin-top:10px">
+    <button class="outline" id="stats-more" onclick="statLoadMore()">显示更多</button>
+    <button class="outline" id="stats-all" onclick="statLoadAll()">全部加载</button>
+  </div>
+</div>
 </div>
 
 </div>
@@ -875,34 +949,114 @@ function pollCls(){
 }
 
 // ---- 统计 ----
+let statField=null, statShown=0, statTotal=0, statTimer=null;
+const STAT_PAGE=20, STAT_STEP=100;
+const FIELD_CN_STAT={artist:'作者',group_name:'社团',parody:'原作',
+  character:'角色',tags:'标签',language:'语言',category:'分类',
+  format:'格式',title:'标题',title_original:'原标题',page_count:'页数',
+  translated:'翻译',year:'年',source_gid:'来源ID',other_fields:'其它字段'};
+
 function loadStats(){
   fetch('/api/stats').then(r=>r.json()).then(d=>{
-    const el=document.getElementById('stats-content');
-    if(d.error){el.innerHTML='<div class="card">'+esc(d.error)+'</div>';return;}
-    const maxCount=Math.max(...d.langs.map(l=>l.count),1);
-    let html='<div class="card"><h3>总览</h3>';
-    html+='<p>压缩包总数: <b>'+d.total+'</b></p>';
-    html+='<p>有元数据: <b>'+d.with_meta+'</b> / '+d.total+'</p>';
-    html+='<p>读取失败: <b>'+d.errors+'</b></p></div>';
-    html+='<div class="card"><h3>语言分布</h3>';
-    d.langs.forEach(l=>{
-      html+='<div class="bar"><div class="bar-fill" style="width:'+(l.count/maxCount*100)+'%">'+l.name+' '+l.count+'</div></div>';
-    });
-    html+='</div>';
-    html+='<div class="card"><h3>作者 Top15</h3>';
-    const maxA=Math.max(...d.artists.map(a=>a.count),1);
-    d.artists.forEach(a=>{
-      html+='<div class="bar"><div class="bar-fill" style="width:'+(a.count/maxA*100)+'%">'+a.name+' '+a.count+'</div></div>';
-    });
-    html+='</div>';
-    html+='<div class="card"><h3>原作分布</h3>';
-    const maxP=Math.max(...d.parodies.map(p=>p.count),1);
-    d.parodies.forEach(p=>{
-      html+='<div class="bar"><div class="bar-fill" style="width:'+(p.count/maxP*100)+'%">'+p.name+' '+p.count+'</div></div>';
-    });
-    html+='</div>';
-    el.innerHTML=html;
+    const el=document.getElementById('stats-overview');
+    if(d.error){el.innerHTML='<b>总览</b><p>'+esc(d.error)+'</p>';return;}
+    el.innerHTML='<b>总览</b>'+
+      '<p>压缩包总数: <b>'+d.total+'</b></p>'+
+      '<p>有元数据: <b>'+d.with_meta+'</b> / '+d.total+'</p>'+
+      '<p>读取失败: <b>'+d.errors+'</b></p>'+
+      '<p>平均每个作品 <b>'+d.avg_tags+'</b> 个标签</p>'+
+      '<p style="font-size:12px;color:#666;margin-top:6px">点下面按钮看某个字段的分布</p>';
+    // 字段按钮
+    const fe=document.getElementById('stats-fields');
+    fe.innerHTML=(d.fields||[]).map(f=>
+      '<button class="outline" onclick="pickStatField(\''+f.field+'\')">'+
+      esc(FIELD_CN_STAT[f.field]||f.field)+
+      ' <span style="font-size:11px;color:#888">'+f.distinct+'</span></button>').join('');
   });
+}
+
+function pickStatField(f){
+  statField=f;statShown=0;
+  document.getElementById('stats-detail-card').style.display='block';
+  document.getElementById('stats-q').value='';
+  loadStatField(true);
+  document.getElementById('stats-detail-card').scrollIntoView({behavior:'smooth'});
+}
+
+function onStatSearch(){
+  if(statTimer)clearTimeout(statTimer);
+  statTimer=setTimeout(()=>loadStatField(true),300);   // 防抖
+}
+
+function loadStatField(reset){
+  if(!statField)return;
+  if(reset)statShown=0;
+  const q=document.getElementById('stats-q').value.trim();
+  const sort=document.getElementById('stats-sort').value;
+  const limit=reset?STAT_PAGE:STAT_STEP;
+  fetch('/api/stat_field?'+new URLSearchParams({field:statField,limit:limit,
+    offset:statShown,q:q,sort:sort}))
+    .then(r=>r.json()).then(d=>{
+      if(d.error){document.getElementById('stats-bars').innerHTML='<p>'+esc(d.error)+'</p>';return;}
+      document.getElementById('stats-detail-title').textContent=
+        (FIELD_CN_STAT[statField]||statField)+' 分布';
+      const bars=document.getElementById('stats-bars');
+      const html=d.top.map(x=>bar(x.name,x.count,d.top[0].count)).join('');
+      if(reset){bars.innerHTML=html||'<p style="color:#888">没有匹配的值</p>';}
+      else{bars.insertAdjacentHTML('beforeend',html);}
+      statShown=d.shown;statTotal=d.total_values;
+      // 长尾折叠提示
+      let meta=d.total_values+' 个不同值';
+      if(d.tail_values>0){
+        meta+=' · 还有 '+d.tail_values+' 个未显示(共 '+d.tail_entries+' 条目)';
+      }
+      document.getElementById('stats-detail-meta').textContent=meta;
+      const more=document.getElementById('stats-more');
+      const all=document.getElementById('stats-all');
+      const hasMore=statShown<d.total_values;
+      more.style.display=hasMore?'inline-block':'none';
+      all.style.display=hasMore?'inline-block':'none';
+    });
+}
+
+function statLoadMore(){loadStatField(false);}
+function statLoadAll(){
+  if(!statField)return;
+  const q=document.getElementById('stats-q').value.trim();
+  const sort=document.getElementById('stats-sort').value;
+  if(statTotal>2000&&!confirm('该字段有 '+statTotal+' 个值,全部加载可能很慢。继续?'))return;
+  fetch('/api/stat_field?'+new URLSearchParams({field:statField,limit:2000,
+    offset:0,q:q,sort:sort}))
+    .then(r=>r.json()).then(d=>{
+      if(d.error)return;
+      const max=d.top.length?d.top[0].count:1;
+      document.getElementById('stats-bars').innerHTML=
+        d.top.map(x=>bar(x.name,x.count,max)).join('');
+      statShown=d.shown;
+      let meta=d.total_values+' 个不同值';
+      if(d.tail_values>0)meta+=' · 还有 '+d.tail_values+' 个未显示(超过2000上限)';
+      document.getElementById('stats-detail-meta').textContent=meta;
+      document.getElementById('stats-more').style.display='none';
+      document.getElementById('stats-all').style.display='none';
+    });
+}
+
+function bar(name,count,max){
+  const w=max?Math.max(count/max*100,2):2;   // 最小 2% 保证可见
+  return '<div class="bar" onclick="statToBrowse(\''+esc(name).replace(/'/g,"")+'\')"'+
+    ' style="cursor:pointer"><div class="bar-fill" style="width:'+w+'%">'+
+    esc(name)+' <span style="opacity:.8">'+count+'</span></div></div>';
+}
+
+// 点统计条 -> 跳到浏览页按该值筛选
+function statToBrowse(val){
+  if(!statField)return;
+  showPage('browse');
+  const f=document.getElementById('browse-field');
+  if(f){f.value=statField;}
+  const c=document.getElementById('browse-contains');
+  if(c){c.value=val;}
+  doQuery();
 }
 
 // ---- 工具 ----
@@ -986,6 +1140,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/stats":
             self._json(API.stats())
+            return
+        if path == "/api/stat_field":
+            field = qs.get("field", [""])[0]
+            try:
+                limit = min(int(qs.get("limit", ["20"])[0]), 500)
+                offset = max(int(qs.get("offset", ["0"])[0]), 0)
+            except ValueError:
+                self._json({"error": "limit/offset 必须是数字"})
+                return
+            q = qs.get("q", [""])[0]
+            sort = qs.get("sort", ["count"])[0]
+            self._json(API.stat_field(field, limit, offset, q, sort))
             return
         if path == "/api/plugins":
             self._json(API.plugins())
