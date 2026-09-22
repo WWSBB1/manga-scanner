@@ -817,6 +817,151 @@ def query_archives(db_path=DEFAULT_DB, conditions=None, join="and", limit=2000):
     return list_archives(db_path, where, args, limit)
 
 
+# ---------------------------------------------------------------- 值级筛选
+
+def _all_values(db_path, field, limit=20000):
+    """某字段在库里出现过的全部值(用于否定条件求补集)。"""
+    conn = sqlite3.connect(db_path)
+    try:
+        return {r[0] for r in conn.execute(
+            "SELECT DISTINCT value FROM meta_values WHERE field=? LIMIT ?",
+            (field, limit))}
+    finally:
+        conn.close()
+
+
+def _narrow_one(db_path, cond):
+    """单个条件 -> (字段, 保留的值集合)。
+
+    返回 None 表示这个条件是作品级的(为空/不为空), 不收窄值集合。
+    """
+    field = (cond.get("field") or "").strip()
+    op = (cond.get("op") or "eq").strip()
+    value = cond.get("value")
+    if field not in VALID_FIELDS:
+        raise ValueError(f"非法字段: {field}")
+    if op not in VALID_OPS:
+        raise ValueError(f"非法操作符: {op}")
+    # 为空/不为空是作品级的: 一个作品在某字段上要么有值要么没有
+    if op in ("empty", "not_empty"):
+        return None
+    if op in COUNT_OPS:
+        v = _to_int(value or 0)
+        if op == "count_eq":
+            lo = hi = v
+        elif op == "count_gte":
+            lo, hi = v, 0
+        else:
+            lo, hi = 0, v
+        return field, set(count_groups(db_path, field, min_count=lo,
+                                       max_count=hi))
+    allv = _all_values(db_path, field)
+    if op == "eq":
+        return field, {value} if value in allv else set()
+    if op == "ne":
+        return field, allv - {value}
+    if op == "contains":
+        return field, {v for v in allv if value in v}
+    if op == "not_contains":
+        return field, {v for v in allv if value not in v}
+    return None
+
+
+def narrow_values(db_path, conditions, join="and"):
+    """算出每个条件字段上保留的值集合。
+
+    同一字段的多个条件各自在**原始值集合**上计算, 再按 join 合并 ——
+    不是在第一个条件的结果上继续过滤, 所以条件之间没有顺序依赖。
+
+    返回 {字段: 保留的值集合}。作品级条件(为空/不为空)不出现在结果里。
+    """
+    if join not in VALID_JOINS:
+        raise ValueError(f"非法组合符: {join}")
+    per_field = {}
+    for c in conditions or []:
+        got = _narrow_one(db_path, c)
+        if got is None:
+            continue
+        field, vals = got
+        per_field.setdefault(field, []).append(vals)
+    out = {}
+    for field, sets in per_field.items():
+        if join == "and":
+            acc = sets[0]
+            for s in sets[1:]:
+                acc = acc & s
+        else:
+            acc = set()
+            for s in sets:
+                acc |= s
+        out[field] = acc
+    return out
+
+
+def query_entries(db_path=DEFAULT_DB, conditions=None, join="and",
+                  fields=None, limit=5000):
+    """按条件筛选, 返回**条目级**结果。
+
+    条目 = (作品, 字段, 值)。多值字段一个作品会展开成多个条目,
+    每个条目独立参与筛选 —— 所以 `角色 不包含 alice` 只会干掉 alice
+    这个条目, 同作品的 bob/carol 照常保留。
+
+    fields: 限定返回哪些字段的条目; None 表示全部 MULTI_FIELDS。
+    返回 [{archive_id, name, path, field, value, meta}], 按 name/field/value 排序。
+    """
+    conditions = list(conditions or [])
+    narrow = narrow_values(db_path, conditions, join)
+
+    # 作品级条件(为空/不为空)先用 SQL 圈定候选作品
+    work_level = [c for c in conditions
+                  if (c.get("op") or "eq") in ("empty", "not_empty")]
+    if work_level:
+        where, args = build_where(work_level, join)
+    else:
+        where, args = "1=1", []
+
+    conn = sqlite3.connect(db_path)
+    try:
+        cols = ["id", "name", "path"] + META_COLUMNS
+        sql = ("SELECT a.id, a.name, a.path, "
+               + ",".join(f"m.{c}" for c in META_COLUMNS)
+               + " FROM archives a LEFT JOIN meta m ON m.archive_id=a.id "
+                 f"WHERE {where} ORDER BY a.name")
+        rows = conn.execute(sql, args).fetchall()
+        mv_rows = conn.execute(
+            "SELECT archive_id, field, value FROM meta_values").fetchall()
+    finally:
+        conn.close()
+
+    want = set(fields) if fields else None
+    vals_by = {}
+    for aid, f, v in mv_rows:
+        if want is not None and f not in want:
+            continue
+        vals_by.setdefault((aid, f), []).append(v)
+
+    out = []
+    for r in rows:
+        d = dict(zip(cols, r))
+        aid = d["id"]
+        meta = {k: d.get(k) for k in META_COLUMNS}
+        for f in (fields if fields else MULTI_FIELDS):
+            # 被条件收窄过的字段用收窄后的集合
+            if f in narrow:
+                allowed = narrow[f]
+                vals = [v for v in vals_by.get((aid, f), []) if v in allowed]
+            else:
+                vals = vals_by.get((aid, f), [])
+            for v in vals:
+                out.append({"archive_id": aid, "name": d["name"],
+                            "path": d["path"], "field": f, "value": v,
+                            "meta": meta})
+        if len(out) >= limit:
+            break
+    out.sort(key=lambda e: (e["name"], e["field"], e["value"]))
+    return out[:limit]
+
+
 # ---------------------------------------------------------------- 分组目录
 
 PATH_UNSAFE = str.maketrans({"/": "_", "\\": "_", ":": "_", "*": "_",
