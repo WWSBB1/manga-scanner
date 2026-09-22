@@ -668,8 +668,11 @@ def build_where(conditions, join="and"):
     conditions: [{"field": "artist", "op": "eq", "value": "zmix"}, ...]
     join:       "and" | "or"
 
+    匹配基于 meta_values 关联表的拆分值: 多值字段里任一值命中即算命中。
     字段名走白名单校验(防 SQL 注入),值一律走参数绑定。
     空条件列表返回匹配全部的条件。
+
+    返回的 SQL 片段引用 archives 表的别名 a。
     """
     if join not in VALID_JOINS:
         raise ValueError(f"非法组合符: {join}")
@@ -677,7 +680,7 @@ def build_where(conditions, join="and"):
         return "1=1", []
 
     parts, args = [], []
-    for i, c in enumerate(conditions):
+    for c in conditions:
         field = (c.get("field") or "").strip()
         op = (c.get("op") or "eq").strip()
         value = c.get("value")
@@ -685,24 +688,36 @@ def build_where(conditions, join="and"):
             raise ValueError(f"非法字段: {field}")
         if op not in VALID_OPS:
             raise ValueError(f"非法操作符: {op}")
-        col = f"m.{field}"
-        if op == "eq":
-            parts.append(f"{col} = ?")
-            args.append(value)
-        elif op == "ne":
-            # NULL 也算"不等于",这是用户的直觉预期
-            parts.append(f"({col} IS NULL OR {col} != ?)")
-            args.append(value)
-        elif op == "contains":
-            parts.append(f"{col} LIKE ?")
-            args.append(f"%{value}%")
-        elif op == "not_contains":
-            parts.append(f"({col} IS NULL OR {col} NOT LIKE ?)")
-            args.append(f"%{value}%")
-        elif op == "empty":
-            parts.append(f"({col} IS NULL OR {col} = '')")
+        if op == "empty":
+            parts.append(
+                "NOT EXISTS (SELECT 1 FROM meta_values mv "
+                "WHERE mv.archive_id=a.id AND mv.field=?)")
+            args.append(field)
         elif op == "not_empty":
-            parts.append(f"({col} IS NOT NULL AND {col} != '')")
+            parts.append(
+                "EXISTS (SELECT 1 FROM meta_values mv "
+                "WHERE mv.archive_id=a.id AND mv.field=?)")
+            args.append(field)
+        elif op == "eq":
+            parts.append(
+                "EXISTS (SELECT 1 FROM meta_values mv "
+                "WHERE mv.archive_id=a.id AND mv.field=? AND mv.value=?)")
+            args += [field, value]
+        elif op == "ne":
+            parts.append(
+                "NOT EXISTS (SELECT 1 FROM meta_values mv "
+                "WHERE mv.archive_id=a.id AND mv.field=? AND mv.value=?)")
+            args += [field, value]
+        elif op == "contains":
+            parts.append(
+                "EXISTS (SELECT 1 FROM meta_values mv "
+                "WHERE mv.archive_id=a.id AND mv.field=? AND mv.value LIKE ?)")
+            args += [field, f"%{value}%"]
+        elif op == "not_contains":
+            parts.append(
+                "NOT EXISTS (SELECT 1 FROM meta_values mv "
+                "WHERE mv.archive_id=a.id AND mv.field=? AND mv.value LIKE ?)")
+            args += [field, f"%{value}%"]
     glue = f" {join.upper()} "
     return glue.join(parts), args
 
