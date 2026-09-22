@@ -619,8 +619,9 @@ const CLS_FIELDS=[['artist','作者'],['group_name','社团'],['parody','原作'
   ['character','角色'],['language','语言'],['category','分类'],
   ['tags','标签'],['title','标题'],['format','格式']];
 const CLS_OPS=[['eq','等于'],['ne','不等于'],['contains','包含'],
-  ['not_contains','不包含'],['empty','为空'],['not_empty','不为空']];
-let condSeq=0, previewNames=null;
+  ['not_contains','不包含'],['empty','为空'],['not_empty','不为空'],
+  ['count_gte','数量>='],['count_lte','数量<=']];
+let condSeq=0, previewNames=null, lastPlan=null;
 
 function addCond(field,op,value){
   const id=++condSeq;
@@ -634,6 +635,16 @@ function addCond(field,op,value){
     '<input type="text" class="c-val" placeholder="值" value="'+esc(value||'')+'">'+
     '<button class="del" onclick="delCond('+id+')">×</button>';
   document.getElementById('cls-conds').appendChild(div);
+  // 操作符切换时更新输入框提示; 数量条件和"为空/不为空"的输入框行为不同
+  const opSel=div.querySelector('.c-op'), valIn=div.querySelector('.c-val');
+  function syncVal(){
+    const o=opSel.value;
+    valIn.placeholder=o.startsWith('count_')?'数字':'值';
+    valIn.disabled=(o==='empty'||o==='not_empty');
+    if(valIn.disabled)valIn.value='';
+  }
+  opSel.addEventListener('change',syncVal);
+  syncVal();
   updateCondIdx();
 }
 function delCond(id){
@@ -680,21 +691,31 @@ function doPreview(){
     .then(r=>r.json()).then(d=>{
       if(d.error){alert('预览失败: '+d.error);return;}
       previewNames=d.plan.map(x=>x.name);
+      lastPlan=d.plan;
       const tb=document.querySelector('#cls-table tbody');
+      // 统计实际会写出多少份(多值字段会扇出)
+      const fanout=d.plan.reduce((s,x)=>s+((x.targets&&x.targets.length)||1),0);
       document.getElementById('cls-count').textContent=
-        d.count+' 个文件将被'+(p.mode=='move'?'移动':'复制');
+        d.count+' 个文件将被'+(p.mode=='move'?'移动':'复制')+
+        (fanout>d.count?(' ('+fanout+' 份,有文件重复归档)'):'');
       const miss=document.getElementById('cls-missing');
       if(d.missing&&d.missing.length){
         miss.textContent='⚠ '+d.missing.length+' 个文件在磁盘上找不到,会被跳过';
       }else{miss.textContent='';}
       const base=p.base_dir;
+      const shortName=x=>(x.name||'').slice(0,38);
       tb.innerHTML=d.plan.map(x=>{
-        const sub=x.dest_dir&&x.dest_dir!==base
-          ? '<span class="hl">'+esc(x.dest_dir.slice(base.length).replace(/^\//,''))+'</span>/'
-          : '';
+        const tg=(x.targets&&x.targets.length)?x.targets:[x.dest_dir];
+        const subOf=t=>(t&&t!==base)?t.slice(base.length).replace(/^\//,''):'(基础目录)';
+        let destHtml='<span class="hl">'+esc(subOf(tg[0]))+'</span>/'+esc(shortName(x));
+        if(tg.length>1){
+          destHtml+='<br>'+tg.slice(1).map(t=>
+            '<span class="hl">'+esc(subOf(t))+'</span>/'+esc(shortName(x))).join('<br>');
+          destHtml+=' <span class="badge">共'+tg.length+'份</span>';
+        }
         const bad=x.exists_src?'':' style="opacity:.45"';
-        return '<tr'+bad+'><td>'+esc((x.name||'').slice(0,45))+'</td>'+
-          '<td class="dest-path">'+sub+esc((x.name||'').slice(0,45))+'</td></tr>';
+        return '<tr'+bad+'><td>'+esc((x.name||'').slice(0,40))+'</td>'+
+          '<td class="dest-path">'+destHtml+'</td></tr>';
       }).join('')||'<tr><td colspan=2>没有匹配的文件</td></tr>';
       document.getElementById('cls-preview-card').classList.remove('hidden');
       document.getElementById('cls-preview-card').scrollIntoView({behavior:'smooth'});
@@ -702,7 +723,7 @@ function doPreview(){
 }
 function hidePreview(){
   document.getElementById('cls-preview-card').classList.add('hidden');
-  previewNames=null;
+  previewNames=null;lastPlan=null;
 }
 function doClassify(){
   const p=clsPayload();
@@ -713,7 +734,18 @@ function doClassify(){
   }
   const names=previewNames;
   if(!names||!names.length){alert('没有要处理的文件,先预览一下');return;}
-  if(p.mode=='move'&&!confirm('确定要移动 '+names.length+' 个文件吗?原位置的文件会被删除。'))return;
+  // 移动是不可逆的: 说明会生成几份,并明确原文件会被删
+  let fanout=names.length;
+  if(lastPlan){
+    fanout=lastPlan.reduce((s,x)=>s+((x.targets&&x.targets.length)||1),0);
+  }
+  if(p.mode=='move'){
+    const extra=fanout>names.length
+      ? '\n有多个作者/角色/标签的作品会在每个目录各放一份副本(共 '+fanout+' 份)。'
+      : '';
+    if(!confirm('确定要移动 '+names.length+' 个文件吗?'+extra+
+        '\n原位置的文件会被删除,此操作不可撤销。'))return;
+  }
   fetch('/api/classify',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({names,dest:p.base_dir,mode:p.mode,
       group_by:p.group_by,src_dir:p.src_dir,recursive:p.recursive})})
@@ -747,7 +779,7 @@ function pollCls(){
           const r=d.result;
           document.getElementById('cls-count').textContent=
             '完成: '+(r.ok||0)+' 成功, '+(r.fail||0)+' 失败';
-          previewNames=null;   // 执行完要重新预览
+          previewNames=null;lastPlan=null;   // 执行完要重新预览
           if(r.fail&&d.errors){
             const es=Object.entries(d.errors).slice(0,5)
               .map(([k,v])=>k.slice(0,30)+': '+v).join('\n');
