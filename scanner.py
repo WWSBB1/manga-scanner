@@ -97,6 +97,26 @@ def _decode(data):
     return data.decode("utf-8", "replace")
 
 
+def split_values(raw):
+    """把一个字段的原始值拆成多个独立值。
+
+    分隔符是逗号(兼容全角),去空白、去重、丢弃空项。
+    None / 空串 / 纯空白都返回空列表。
+    """
+    if raw is None:
+        return []
+    s = str(raw)
+    for sep in _VALUE_SEPS[1:]:
+        s = s.replace(sep, _VALUE_SEPS[0])
+    out, seen = [], set()
+    for part in s.split(_VALUE_SEPS[0]):
+        v = part.strip()
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
 # ---------------------------------------------------------------- 元数据解析
 
 def _strip_ns(tag):
@@ -400,6 +420,15 @@ CREATE INDEX IF NOT EXISTS idx_meta_artist ON meta(artist);
 CREATE INDEX IF NOT EXISTS idx_meta_parody ON meta(parody);
 CREATE INDEX IF NOT EXISTS idx_meta_language ON meta(language);
 CREATE INDEX IF NOT EXISTS idx_archives_has_meta ON archives(has_meta);
+
+CREATE TABLE IF NOT EXISTS meta_values (
+    archive_id INTEGER NOT NULL REFERENCES archives(id) ON DELETE CASCADE,
+    field      TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    PRIMARY KEY (archive_id, field, value)
+);
+CREATE INDEX IF NOT EXISTS idx_mv_field_value ON meta_values(field, value);
+CREATE INDEX IF NOT EXISTS idx_mv_archive ON meta_values(archive_id);
 """
 
 ARCHIVE_COLUMNS = ["name", "path", "size", "mtime", "entry_count", "image_count",
@@ -411,12 +440,19 @@ META_COLUMNS = ["title", "title_original", "artist", "group_name", "parody",
                 "source_url", "source_gid", "year", "month", "day",
                 "translated", "format", "other_fields"]
 
+# 需要拆分成多个值的字段(全部字段都拆,统一处理逻辑)
+MULTI_FIELDS = list(META_COLUMNS)
+
+# 值分隔符: 逗号,全角半角都认
+_VALUE_SEPS = (",", "，")
+
 
 def open_db(path=DEFAULT_DB):
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    migrate_meta_values(conn)
     conn.commit()
     return conn
 
@@ -440,7 +476,41 @@ def save(conn, rec):
         _upsert(conn, "meta", "archive_id", dict(m, archive_id=aid))
     else:
         conn.execute("DELETE FROM meta WHERE archive_id=?", (aid,))
+    _save_meta_values(conn, aid, m)
     return aid
+
+
+def _save_meta_values(conn, archive_id, meta_row):
+    """把一条记录的 meta 字段拆开写进关联表。"""
+    conn.execute("DELETE FROM meta_values WHERE archive_id=?", (archive_id,))
+    if not meta_row:
+        return
+    rows = []
+    for field in MULTI_FIELDS:
+        for v in split_values(meta_row.get(field)):
+            rows.append((archive_id, field, v))
+    if rows:
+        conn.executemany(
+            "INSERT OR IGNORE INTO meta_values (archive_id, field, value) "
+            "VALUES (?,?,?)", rows)
+
+
+def migrate_meta_values(conn):
+    """老库回填: meta 表已有数据但 meta_values 是空的。返回处理行数。"""
+    have = conn.execute("SELECT COUNT(*) FROM meta_values").fetchone()[0]
+    if have:
+        return 0
+    total = 0
+    rows = conn.execute(
+        "SELECT archive_id, " + ",".join(MULTI_FIELDS) + " FROM meta"
+    ).fetchall()
+    for row in rows:
+        aid = row[0]
+        meta_row = dict(zip(MULTI_FIELDS, row[1:]))
+        _save_meta_values(conn, aid, meta_row)
+        total += 1
+    conn.commit()
+    return total
 
 
 def load_existing(conn):
