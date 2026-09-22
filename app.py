@@ -285,9 +285,10 @@ class API:
                 errors = conn.execute(
                     "SELECT COUNT(*) FROM archives WHERE error IS NOT NULL"
                     ).fetchone()[0]
-                # 各字段: 不同值个数 + 条目总数, 供字段选择器显示规模
+                # 各字段: 不同值个数 + 条目总数, 供字段选择器显示规模。
+                # 只统计有分类意义的字段(见 scanner.STAT_FIELDS)
                 fields = []
-                for f in scanner.MULTI_FIELDS:
+                for f in scanner.STAT_FIELDS:
                     n = conn.execute(
                         "SELECT COUNT(DISTINCT value) FROM meta_values "
                         "WHERE field=?", (f,)).fetchone()[0]
@@ -322,7 +323,7 @@ class API:
         返回 top(当前页) + total_values(该字段不同值总数) +
              tail(剩余值的数量和作品数, 用于显示"其他 N 项")
         """
-        if field not in scanner.MULTI_FIELDS:
+        if field not in scanner.STAT_FIELDS:
             return {"error": f"非法字段: {field}"}
         try:
             conn = sqlite3.connect(DB_PATH)
@@ -597,6 +598,15 @@ checkbox-row{display:block;margin:4px 0}
     <button class="outline" id="stats-all" onclick="statLoadAll()">全部加载</button>
   </div>
 </div>
+
+<!-- 点分布条后在这里展开作品列表, 不跳页 -->
+<div class="card" id="stats-drill" style="display:none">
+  <div class="row" style="justify-content:space-between">
+    <b id="stats-drill-title">作品</b>
+    <button class="outline" onclick="closeStatDrill()">返回分布</button>
+  </div>
+  <div id="stats-drill-body" style="margin-top:6px"></div>
+</div>
 </div>
 
 </div>
@@ -628,6 +638,8 @@ function showPage(p){
   document.getElementById('page-'+p).classList.remove('hidden');
   document.querySelectorAll('.nav a').forEach(a=>a.classList.remove('active'));
   document.getElementById('nav-'+p).classList.add('active');
+  // 统计页首次进入自动加载, 不用手动点刷新
+  if(p==='stats'&&!statsLoaded)loadStats();
 }
 showPage('scan');
 
@@ -949,7 +961,7 @@ function pollCls(){
 }
 
 // ---- 统计 ----
-let statField=null, statShown=0, statTotal=0, statTimer=null;
+let statField=null, statShown=0, statTotal=0, statTimer=null, statsLoaded=false;
 const STAT_PAGE=20, STAT_STEP=100;
 const FIELD_CN_STAT={artist:'作者',group_name:'社团',parody:'原作',
   character:'角色',tags:'标签',language:'语言',category:'分类',
@@ -957,6 +969,7 @@ const FIELD_CN_STAT={artist:'作者',group_name:'社团',parody:'原作',
   translated:'翻译',year:'年',source_gid:'来源ID',other_fields:'其它字段'};
 
 function loadStats(){
+  statsLoaded=true;
   fetch('/api/stats').then(r=>r.json()).then(d=>{
     const el=document.getElementById('stats-overview');
     if(d.error){el.innerHTML='<b>总览</b><p>'+esc(d.error)+'</p>';return;}
@@ -965,7 +978,7 @@ function loadStats(){
       '<p>有元数据: <b>'+d.with_meta+'</b> / '+d.total+'</p>'+
       '<p>读取失败: <b>'+d.errors+'</b></p>'+
       '<p>平均每个作品 <b>'+d.avg_tags+'</b> 个标签</p>'+
-      '<p style="font-size:12px;color:#666;margin-top:6px">点下面按钮看某个字段的分布</p>';
+      '<p style="font-size:12px;color:#666;margin-top:6px">点下面按钮切换字段</p>';
     // 字段按钮
     const fe=document.getElementById('stats-fields');
     fe.innerHTML=(d.fields||[]).map(f=>
@@ -977,6 +990,7 @@ function loadStats(){
 
 function pickStatField(f){
   statField=f;statShown=0;
+  closeStatDrill();
   document.getElementById('stats-detail-card').style.display='block';
   document.getElementById('stats-q').value='';
   loadStatField(true);
@@ -1048,15 +1062,38 @@ function bar(name,count,max){
     esc(name)+' <span style="opacity:.8">'+count+'</span></div></div>';
 }
 
-// 点统计条 -> 跳到浏览页按该值筛选
+// 点分布条 -> 在统计页内展开该值的作品列表(不跳页, 可随时返回)
+let statDrill=null;   // 当前下钻的值
 function statToBrowse(val){
   if(!statField)return;
-  showPage('browse');
-  const f=document.getElementById('browse-field');
-  if(f){f.value=statField;}
-  const c=document.getElementById('browse-contains');
-  if(c){c.value=val;}
-  doQuery();
+  statDrill=val;
+  const box=document.getElementById('stats-drill');
+  box.style.display='block';
+  document.getElementById('stats-drill-title').textContent=
+    (FIELD_CN_STAT[statField]||statField)+' = '+val;
+  document.getElementById('stats-drill-body').innerHTML='<p>加载中…</p>';
+  fetch('/api/query?'+new URLSearchParams({field:statField,value:val,contains:''}))
+    .then(r=>r.json()).then(d=>{
+      if(d.error){document.getElementById('stats-drill-body').innerHTML='<p>'+esc(d.error)+'</p>';return;}
+      const rows=d.rows.map(r=>{
+        const m=cols2obj(d.columns,r);
+        return '<tr onclick="showDetail('+JSON.stringify(m.name)+')">'+
+          '<td>'+esc((m.name||'').slice(0,42))+'</td>'+
+          '<td>'+esc((m.artist||'').slice(0,18))+'</td>'+
+          '<td>'+esc(m.language||'')+'</td>'+
+          '<td>'+(m.page_count||'')+'</td></tr>';
+      }).join('');
+      document.getElementById('stats-drill-body').innerHTML=
+        '<div style="font-size:12px;color:#666;margin-bottom:6px">'+d.count+' 个作品</div>'+
+        '<div style="max-height:320px;overflow:auto"><table>'+
+        '<thead><tr><th>文件名</th><th>作者</th><th>语言</th><th>页数</th></tr></thead>'+
+        '<tbody>'+(rows||'<tr><td colspan=4>无</td></tr>')+'</tbody></table></div>';
+      box.scrollIntoView({behavior:'smooth'});
+    });
+}
+function closeStatDrill(){
+  statDrill=null;
+  document.getElementById('stats-drill').style.display='none';
 }
 
 // ---- 工具 ----

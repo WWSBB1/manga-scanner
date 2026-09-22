@@ -655,6 +655,12 @@ def filter_archives(db_path=DEFAULT_DB, field=None, value=None,
 # ---------------------------------------------------------------- 多条件筛选
 
 VALID_FIELDS = set(META_COLUMNS) | {"language", "category"}
+
+# 适合做分布统计的字段(有分类意义、值可复用)。
+# 排除掉 title/source_url/source_gid/month/day 这些:
+# 它们的每个值几乎只对应一个作品, 统计出来没有意义。
+STAT_FIELDS = ["artist", "group_name", "parody", "character",
+               "tags", "language", "category", "format"]
 VALID_OPS = {
     "eq": "等于", "ne": "不等于", "contains": "包含",
     "not_contains": "不包含", "empty": "为空", "not_empty": "不为空",
