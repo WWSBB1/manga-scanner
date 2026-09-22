@@ -939,11 +939,27 @@ def query_entries(db_path=DEFAULT_DB, conditions=None, join="and",
         if want is not None and f not in want:
             continue
         vals_by.setdefault((aid, f), []).append(v)
+    # 每个作品在**全部**被收窄字段上的值(用于判断作品是否还该出现)。
+    # 不能只看 fields 里的字段: 条件是 `作者>=5 且 角色不含sensei` 而
+    # fields=['character'] 时, 作者收窄也必须过滤作品, 否则会返回全部作品。
+    all_by = {}
+    for aid, f, v in mv_rows:
+        if f in narrow:
+            all_by.setdefault(aid, {}).setdefault(f, []).append(v)
 
     out = []
     for r in rows:
         d = dict(zip(cols, r))
         aid = d["id"]
+        # 收窄后没有任何值的字段 -> 这个作品被条件排除了
+        skip = False
+        for f, allowed in narrow.items():
+            have = all_by.get(aid, {}).get(f, [])
+            if not any(v in allowed for v in have):
+                skip = True
+                break
+        if skip:
+            continue
         meta = {k: d.get(k) for k in META_COLUMNS}
         for f in (fields if fields else MULTI_FIELDS):
             # 被条件收窄过的字段用收窄后的集合
