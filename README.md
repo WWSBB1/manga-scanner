@@ -22,12 +22,12 @@ bash <项目目录>/start.sh
 # 或局域网: http://<手机IP>:8951
 ```
 
-环境变量: `MANGA_DB`(默认 manga.db)、`MANGA_PORT`(默认 8951)。
+环境变量: `MANGA_DB`(默认 `mangaapp/manga.db`,和程序放一起)、`MANGA_PORT`(默认 8951)。
 
 命令行直接用核心库(不开界面):
 
 ```bash
-python3 scanner.py --dir /storage/emulated/0/Download --db manga.db
+python3 scanner.py --dir /storage/emulated/0/Download
 python3 test_core.py
 ```
 

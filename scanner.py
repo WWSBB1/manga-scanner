@@ -32,7 +32,8 @@ import zipfile
 # ---------------------------------------------------------------- 配置
 
 DEFAULT_SCAN_DIRS = ["/storage/emulated/0/Download"]
-DEFAULT_DB = "manga.db"
+# 默认库放在项目目录里(和程序文件一起, 便于整体移动/备份)
+DEFAULT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "manga.db")
 
 ARCHIVE_EXT = (".zip", ".cbz")
 SUPPORTED = ARCHIVE_EXT          # 能真正解析的

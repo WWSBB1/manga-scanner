@@ -25,7 +25,8 @@ import scanner
 import fileops
 import plugin_loader
 
-DB_PATH = os.environ.get("MANGA_DB", "manga.db")
+DB_PATH = os.environ.get("MANGA_DB",
+                        os.path.join(BASE, "manga.db"))
 PORT = int(os.environ.get("MANGA_PORT", "8951"))
 
 FILTER_FIELDS = [
