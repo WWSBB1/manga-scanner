@@ -28,30 +28,29 @@ def _unique_dest(dest):
     raise RuntimeError(f"无法生成不冲突的文件名: {dest}")
 
 
-def transfer_one(src, dest_dir, mode="copy", log=print):
-    """移动/复制单个文件。返回 (成功?, 消息)。
+def _copy_verified(src, dest_dir, log=print):
+    """复制到 dest_dir 并校验大小,不删源。返回 (成功?, 目标路径或错误)。
 
-    mode: copy | move
-    目标目录不存在则创建;同名冲突自动改名不覆盖;
-    完成后校验目标大小与源一致,移动模式校验通过才删源。
+    目标目录不存在则创建;同名冲突自动改名不覆盖;失败时清理半成品。
     """
     name = os.path.basename(src)
     if not os.path.isfile(src):
         return False, f"源不存在: {src}"
-    os.makedirs(dest_dir, exist_ok=True)
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+    except OSError as e:
+        return False, f"建目录失败 {dest_dir}: {e}"
     dest = _unique_dest(os.path.join(dest_dir, name))
     src_size = os.path.getsize(src)
     try:
         shutil.copy2(src, dest)
     except Exception as e:
-        # 清理半成品
         try:
             if os.path.exists(dest):
                 os.remove(dest)
         except OSError:
             pass
         return False, f"复制失败: {type(e).__name__}: {e}"
-    # 校验
     try:
         dest_size = os.path.getsize(dest)
     except OSError as e:
@@ -62,6 +61,18 @@ def transfer_one(src, dest_dir, mode="copy", log=print):
         except OSError:
             pass
         return False, f"校验失败(大小 {dest_size} != {src_size})"
+    return True, dest
+
+
+def transfer_one(src, dest_dir, mode="copy", log=print):
+    """移动/复制单个文件到单个目录。返回 (成功?, 目标路径或错误)。
+
+    mode: copy | move
+    完成后校验目标大小与源一致,移动模式校验通过才删源。
+    """
+    ok, msg = _copy_verified(src, dest_dir, log)
+    if not ok:
+        return False, msg
     if mode == "move":
         try:
             os.remove(src)
@@ -70,7 +81,7 @@ def transfer_one(src, dest_dir, mode="copy", log=print):
         # 双保险: 删源后确认源真没了
         if os.path.exists(src):
             return False, "已复制但删源后源仍存在,请手动检查"
-    return True, dest
+    return True, msg
 
 
 def _load_rows(db_path, names):
@@ -94,25 +105,38 @@ def _load_rows(db_path, names):
 def plan_transfer(db_path, names, base_dir, group_by="", mode="copy"):
     """生成搬移计划(不碰文件),供预览和执行共用。
 
-    返回 [{name, src, dest_dir, dest, exists_src}, ...]
-    group_by: 按哪个字段建子目录,空串则不建
+    多值字段会扇出: 一个作品在该字段有多个值就有多个目标目录。
+    返回 [{name, src, targets:[目录...], dest_dir, dest, exists_src, error}]
+    dest_dir / dest 是第一个目标,兼容只关心单目标的调用方。
     """
     rows = _load_rows(db_path, names)
     by_name = {r["name"]: r for r in rows}
+    limit = scanner.VALUE_FANOUT_LIMIT
     plan = []
     for n in names:
         r = by_name.get(n)
         if not r:
-            plan.append({"name": n, "src": None, "dest_dir": None,
-                         "dest": None, "error": "库里查不到"})
+            plan.append({"name": n, "src": None, "targets": [],
+                         "dest_dir": None, "dest": None, "exists_src": False,
+                         "error": "库里查不到"})
             continue
-        sub = scanner.group_subdir(r, group_by)
-        dest_dir = os.path.join(base_dir, sub) if sub else base_dir
+        if group_by:
+            vals = scanner.split_values(r.get(group_by))[:limit] or ["未分类"]
+            subs = []
+            for v in vals:
+                s = scanner.group_subdir({group_by: v}, group_by)
+                if s not in subs:
+                    subs.append(s)
+            targets = [os.path.join(base_dir, s) for s in subs]
+        else:
+            targets = [base_dir]
+        first = targets[0]
         plan.append({
             "name": n,
             "src": r.get("path"),
-            "dest_dir": dest_dir,
-            "dest": os.path.join(dest_dir, n),
+            "targets": targets,
+            "dest_dir": first,
+            "dest": os.path.join(first, n),
             "exists_src": os.path.isfile(r.get("path") or ""),
             "artist": r.get("artist"), "parody": r.get("parody"),
             "language": r.get("language"),
@@ -197,13 +221,42 @@ def transfer_by_names(db_path, names, dest_dir, mode="copy", log=print,
             fail += 1
             errors[n] = "库里查不到路径"
             continue
+        if not os.path.isfile(src):
+            fail += 1
+            errors[n] = f"源文件不存在: {src}"
+            log(f"  ✗ {n[:70]}: {errors[n]}")
+            if progress:
+                progress(i, total)
+            continue
+        targets = p["targets"]
+        # 扇出: 先把除第一个外的目标都复制出来,再搬第一个(移动模式下删源)。
+        # 顺序不可颠倒 —— 先移动会把源搬走,后面的副本就没源可读了。
+        copy_failed = None
+        for t in targets[1:]:
+            try:
+                cok, cmsg = _copy_verified(src, t, log)
+            except Exception as e:
+                cok, cmsg = False, f"{type(e).__name__}: {e}"
+            if not cok:
+                copy_failed = f"副本 {t} 失败: {cmsg}"
+                break
+        if copy_failed:
+            # 副本没做全 -> 不动源文件,已做好的副本保留
+            fail += 1
+            errors[n] = copy_failed
+            log(f"  ✗ {n[:70]}: {copy_failed}")
+            if progress:
+                progress(i, total)
+            continue
         try:
-            success, msg = transfer_one(src, p["dest_dir"], mode, log)
+            success, msg = transfer_one(src, targets[0], mode, log)
         except Exception as e:
             success, msg = False, f"{type(e).__name__}: {e}"
         if success:
             ok += 1
             moved_paths[n] = msg  # msg=新路径
+            if len(targets) > 1:
+                log(f"  ✓ {n[:60]} -> {len(targets)} 个目录")
         else:
             fail += 1
             errors[n] = msg
