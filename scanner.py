@@ -767,8 +767,12 @@ def query_archives(db_path=DEFAULT_DB, conditions=None, join="and", limit=2000):
     """按多条件查询,返回 (cols, rows)。
 
     数量类条件(count_gte / count_lte)先分组计数算出达标的值,
-    再把这些值当成等值条件并入查询。多个数量条件各自独立运算,
-    结果取交集(与其他条件一致)。
+    再把这些值当成等值条件并入查询。
+
+    计数范围是**全部作品**,不受普通条件限制——否则 `作者数量>=5 OR
+    语言=日语` 会先在日语作品里数作者,结果为空,整个 OR 就废了。
+    普通条件照常通过 join 拼接参与,语义是"先各自算集合,再按 join 合并"。
+    多个数量条件之间是交集(用户明确说这种情况该自己规避,不做拦截)。
     """
     conditions = list(conditions or [])
     normal = [c for c in conditions if (c.get("op") or "eq") not in COUNT_OPS]
@@ -777,27 +781,34 @@ def query_archives(db_path=DEFAULT_DB, conditions=None, join="and", limit=2000):
         where, args = build_where(normal, join)
         return list_archives(db_path, where, args, limit)
 
-    # 每个数量条件: 在"其他条件"命中的范围内分组计数
+    # 每个数量条件: 在全部作品范围内分组计数
     extras = []
     for c in counts:
         v = _to_int(c.get("value") or 0)
         lo = v if c.get("op") == "count_gte" else 0
         hi = v if c.get("op") == "count_lte" else 0
-        vals = count_groups(db_path, c["field"], min_count=lo, max_count=hi,
-                            base_conditions=normal, join=join)
+        vals = count_groups(db_path, c["field"], min_count=lo, max_count=hi)
         if not vals:
-            return list_archives(db_path, "1=0", [], limit)
+            # 这个数量条件没有任何达标值, 单独看它是空集
+            if join == "and":
+                return list_archives(db_path, "1=0", [], limit)
+            extras.append((c["field"], []))
+            continue
         extras.append((c["field"], vals))
 
     where, args = build_where(normal, join)
     args = list(args)
     for field, vals in extras:
-        ph = ",".join("?" * len(vals))
-        block = ("EXISTS (SELECT 1 FROM meta_values mv "
-                 "WHERE mv.archive_id=a.id AND mv.field=? "
-                 f"AND mv.value IN ({ph}))")
-        where = f"({where}) AND {block}"
-        args += [field] + vals
+        if not vals:
+            # 空集: AND 下整体为空(上面已提前返回), OR 下这一支不贡献结果
+            block = "1=0"
+        else:
+            ph = ",".join("?" * len(vals))
+            block = ("EXISTS (SELECT 1 FROM meta_values mv "
+                     "WHERE mv.archive_id=a.id AND mv.field=? "
+                     f"AND mv.value IN ({ph}))")
+            args += [field] + vals
+        where = f"({where}) {join.upper()} ({block})"
     return list_archives(db_path, where, args, limit)
 
 
