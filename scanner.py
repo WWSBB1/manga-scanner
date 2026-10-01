@@ -60,10 +60,19 @@ LANG_MAP = {
 
 # 归一化进 meta 表的 ComicInfo 字段,其余进 other_fields
 CI_MAPPED = {"Title", "Writer", "Publisher", "Series", "Tags", "Format",
-             "LanguageISO", "PageCount", "Web", "Year", "Month", "Day"}
+             "LanguageISO", "PageCount", "Web", "Year", "Month", "Day",
+             "Translated"}
+
+# 下载器对"未知"字段填的字面量,一律当空处理,不当作真实值入库
+PLACEHOLDERS = {"unknown", "n/a", "none", "null"}
 
 
 # ---------------------------------------------------------------- 小工具
+
+def _is_placeholder(v):
+    """是否是占位符(Nhentai Helper 等填的 Unknown)。"""
+    return str(v).strip().lower() in PLACEHOLDERS
+
 
 def _first(*vals):
     for v in vals:
@@ -76,10 +85,13 @@ def _join(v):
     if v is None:
         return None
     if isinstance(v, (list, tuple)):
-        items = [str(x).strip() for x in v if str(x).strip()]
+        items = [str(x).strip() for x in v
+                 if str(x).strip() and not _is_placeholder(x)]
         return ", ".join(items) or None
     s = str(v).strip()
-    return s or None
+    if not s or _is_placeholder(s):
+        return None
+    return s
 
 
 def _int(v):
@@ -103,6 +115,7 @@ def split_values(raw):
 
     分隔符是逗号(兼容全角),去空白、去重、丢弃空项。
     None / 空串 / 纯空白都返回空列表。
+    占位符(Unknown)也丢弃 —— 它只表示"未知",不是真实取值。
     """
     if raw is None:
         return []
@@ -112,7 +125,7 @@ def split_values(raw):
     out, seen = [], set()
     for part in s.split(_VALUE_SEPS[0]):
         v = part.strip()
-        if v and v not in seen:
+        if v and v not in seen and not _is_placeholder(v):
             seen.add(v)
             out.append(v)
     return out
@@ -152,17 +165,38 @@ def _load_json(text):
 
 
 def _norm_language(v):
-    """把 'zh' / ['translated','chinese'] / 'chinese' 统一成 'chinese'。"""
+    """把 'zh' / ['translated','chinese'] / 'chinese' 统一成 'chinese'。
+
+    'translated' 是汉化标记不是语言,跳过;占位符(Unknown)视为空。
+    """
     if isinstance(v, (list, tuple)):
         for item in v:
             s = str(item).strip().lower()
-            if s and s != "translated":
+            if s and s != "translated" and not _is_placeholder(s):
                 return LANG_MAP.get(s, s)
         return None
     if not v:
         return None
     s = str(v).strip().lower()
+    if _is_placeholder(s):
+        return None
     return LANG_MAP.get(s, s)
+
+
+def _detect_translated(v):
+    """判断是否汉化/翻译版本。返回 1 或 None。
+
+    认这些写法:
+      ComicInfo <Translated>Yes</Translated> / No
+      metadata.json "language": ["translated", "chinese"]
+      info.json  "translated": true
+    """
+    if isinstance(v, (list, tuple)):
+        return 1 if any(str(x).strip().lower() == "translated" for x in v) else None
+    if v in (None, ""):
+        return None
+    s = str(v).strip().lower()
+    return 1 if s in ("yes", "true", "1", "translated") else None
 
 
 def _gid_from_link(link):
@@ -239,13 +273,16 @@ def parse_metadatajson(text):
     gi = _load_json(text)
     if not gi:
         return None
+    lang = gi.get("language")
     return _canon(
         title=gi.get("title"),
         title_original=gi.get("subtitle"),
         link=gi.get("URL") or gi.get("url"),
         category=gi.get("category"),
         tags=gi,
-        language=gi.get("language"),
+        language=lang,
+        # 汉化标记有两种写法: language 数组含 "translated", 或独立的 translated 字段
+        translated=_detect_translated(lang) or _detect_translated(gi.get("translated")),
         pages=gi.get("Pages"),
     )
 
@@ -311,7 +348,8 @@ def merge_meta(ci, meta_texts, image_count):
         "year": _int(ci.get("Year")) or (up[0] if up else None),
         "month": _int(ci.get("Month")) or (up[1] if up else None),
         "day": _int(ci.get("Day")) or (up[2] if up else None),
-        "translated": 1 if pick("translated") else 0,
+        "translated": 1 if (pick("translated")
+                            or _detect_translated(ci.get("Translated"))) else 0,
         "format": _join(ci.get("Format")),
         "other_fields": json.dumps(other, ensure_ascii=False) if other else None,
     }
