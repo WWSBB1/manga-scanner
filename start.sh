@@ -1,13 +1,26 @@
 #!/bin/sh
 # 漫画管理 APP 启动脚本
-# 用法: <项目目录>/start.sh   然后浏览器开 http://127.0.0.1:8951
-cd <项目目录>
-export MANGA_DB="${MANGA_DB:-manga.db}"
+# 用法: sh start.sh   然后浏览器开 http://127.0.0.1:8951
+# 数据库和端口都可以用环境变量覆盖: MANGA_DB / MANGA_PORT
+
+# 定位到本脚本所在目录, 这样 clone 到任何位置都能跑
+cd "$(dirname "$(readlink -f "$0")")" || exit 1
+
+export MANGA_DB="${MANGA_DB:-$PWD/manga.db}"
 export MANGA_PORT="${MANGA_PORT:-8951}"
 echo "启动漫画管理 APP..."
 echo "数据库: $MANGA_DB"
 echo "浏览器打开: http://127.0.0.1:$MANGA_PORT"
-echo "局域网: http://$(ip addr show wlan0 2>/dev/null | grep -oP 'inet \K[0-9.]+'):$MANGA_PORT"
+
+# 局域网地址: 有 ip 用 ip, 没有就退回 ifconfig, 都拿不到就不显示
+lan_ip=""
+if command -v ip >/dev/null 2>&1; then
+    lan_ip=$(ip addr show wlan0 2>/dev/null | grep -o 'inet [0-9.]*' | cut -d' ' -f2)
+elif command -v ifconfig >/dev/null 2>&1; then
+    lan_ip=$(ifconfig wlan0 2>/dev/null | grep -o 'inet addr:[0-9.]*' | cut -d: -f2)
+fi
+[ -n "$lan_ip" ] && echo "局域网: http://$lan_ip:$MANGA_PORT"
+
 echo "Ctrl+C 停止"
 echo
 

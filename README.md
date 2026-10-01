@@ -17,12 +17,15 @@
 ## 运行
 
 ```bash
-bash <项目目录>/start.sh
+cd <项目目录>
+sh start.sh
 # 手机浏览器打开 http://127.0.0.1:8951
 # 或局域网: http://<手机IP>:8951
 ```
 
-环境变量: `MANGA_DB`(默认 `mangaapp/manga.db`,和程序放一起)、`MANGA_PORT`(默认 8951)。
+`start.sh` 会自己定位到所在目录,放在哪里都能跑。
+
+环境变量: `MANGA_DB`(默认项目目录下的 `manga.db`,和程序放一起)、`MANGA_PORT`(默认 8951)。
 
 命令行直接用核心库(不开界面):
 

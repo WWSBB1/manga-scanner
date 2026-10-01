@@ -443,7 +443,7 @@ checkbox-row{display:block;margin:4px 0}
   <label>扫描目录 (逗号分隔多个)</label>
   <input type="text" id="scan-dir" value="/storage/emulated/0/Download">
   <label style="display:block;margin-top:8px">数据库文件</label>
-  <input type="text" id="scan-db" value="manga.db">
+  <input type="text" id="scan-db" value="__DB_PATH__">
   <div class="row" style="margin-top:8px">
     <label><input type="checkbox" id="rescan"> 强制重扫</label>
     <button onclick="doScan()">开始扫描</button>
@@ -1131,6 +1131,12 @@ const cnMap={name:'文件名',path:'路径',size:'大小',image_count:'图片数
 VALID_FIELDS = set(scanner.META_COLUMNS) | {"language", "category"}
 
 
+def _attr_escape(s):
+    """把值安全放进 HTML 属性(路径里可能有 & " < 等字符)。"""
+    return (str(s).replace("&", "&amp;").replace('"', "&quot;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
+
+
 class Handler(BaseHTTPRequestHandler):
     def _json(self, data, code=200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -1141,6 +1147,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _html(self, html):
+        # 页面里的路径占位符换成实际值(DB 路径随运行位置变)
+        html = html.replace("__DB_PATH__", _attr_escape(DB_PATH))
         body = html.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
