@@ -63,7 +63,7 @@ def fmt_size(n):
 
 class API:
     @staticmethod
-    def scan_start(dirs, db, rescan):
+    def scan_start(dirs, db, rescan, recursive=True):
         sid = f"scan_{int(time.time())}"
         SCAN_WORKERS[sid] = {"running": True, "stop": False,
                              "log": [], "stats": None}
@@ -80,7 +80,7 @@ class API:
                 stats = scanner.scan_dirs(
                     dirs, db, log=log_fn, rescan=rescan,
                     progress=progress,
-                    stop_flag=lambda: w["stop"])
+                    stop_flag=lambda: w["stop"], recursive=recursive)
                 w["stats"] = stats
             except Exception as ex:
                 w["stats"] = {"error": str(ex)}
@@ -460,9 +460,13 @@ checkbox-row{display:block;margin:4px 0}
   <label style="display:block;margin-top:8px">数据库文件</label>
   <input type="text" id="scan-db" value="__DB_PATH__">
   <div class="row" style="margin-top:8px">
+    <label><input type="checkbox" id="scan-recursive"> 扫描子目录</label>
     <label><input type="checkbox" id="rescan"> 强制重扫</label>
     <button onclick="doScan()">开始扫描</button>
     <button class="outline" id="btn-stop" onclick="doStop()" disabled>停止</button>
+  </div>
+  <div style="font-size:12px;color:#666;margin-top:6px">
+    不勾「扫描子目录」时只看这一层, 子目录里的文件不会被扫到。
   </div>
   <div class="progress hidden" id="scan-prog"><div class="progress-fill" style="width:0"></div></div>
   <div id="scan-status">就绪</div>
@@ -675,8 +679,9 @@ function doScan(){
   const dirs=document.getElementById('scan-dir').value;
   const db=document.getElementById('scan-db').value;
   const rescan=document.getElementById('rescan').checked;
+  const recursive=document.getElementById('scan-recursive').checked;
   fetch('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({dirs,db,rescan})})
+    body:JSON.stringify({dirs,db,rescan,recursive})})
     .then(r=>r.json()).then(d=>{
       scanId=d.scan_id;
       document.getElementById('scan-log').textContent='';
@@ -1257,10 +1262,11 @@ class Handler(BaseHTTPRequestHandler):
             dirs = [d.strip() for d in body.get("dirs", "").split(",") if d.strip()]
             db = body.get("db", DB_PATH)
             rescan = body.get("rescan", False)
+            recursive = body.get("recursive", False)   # 界面默认不递归
             if not dirs:
                 self._json({"error": "请填目录"})
                 return
-            self._json(API.scan_start(dirs, db, rescan))
+            self._json(API.scan_start(dirs, db, rescan, recursive))
             return
         if path == "/api/classify":
             names = body.get("names", [])

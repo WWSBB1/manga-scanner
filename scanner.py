@@ -663,18 +663,31 @@ def _scan_one_dir(d):
     return subs, zips, unsup
 
 
-def _collect_targets(dirs, workers, stop_flag):
+def _collect_targets(dirs, workers, stop_flag, recursive=True):
     """遍历目录树, 收集可解析压缩包。返回 (targets, unsupported)。
 
     外接盘上单次 listdir 要 70ms~数秒(FUSE 固定开销), 遍历是整个扫描
     最大的瓶颈——比解析压缩包本身贵得多, 且原本必须全部走完才能开始
     解析。这里按层并行, 实测 16 线程比单线程快两个数量级。
 
+    recursive: False 时只看给定目录这一层, 不下潜子目录。
     stop_flag 在遍历阶段也生效(原本 os.walk 阶段点停止没反应)。
     """
     targets, unsupported = [], []
     roots = [d for d in dirs if os.path.isdir(d)]
     if not roots:
+        return targets, unsupported
+
+    if not recursive:
+        # 只要一层: 完全没有"下一层"要展开, 并行仍是逐目录跑
+        if workers <= 1:
+            results = [_scan_one_dir(d) for d in roots]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                results = list(ex.map(_scan_one_dir, roots))
+        for subs, zips, unsup in results:
+            targets.extend(zips)
+            unsupported.extend(unsup)
         return targets, unsupported
 
     def harvest(results):
@@ -709,12 +722,14 @@ def _collect_targets(dirs, workers, stop_flag):
 # ---------------------------------------------------------------- 主扫描流程
 
 def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
-              progress=None, stop_flag=None, workers=None):
+              progress=None, stop_flag=None, workers=None, recursive=True):
     """扫描目录列表,增量入库。返回统计 dict。
 
     log:        每行日志的回调(GUI 里接 UI)
     progress:   (done, total) 回调
     stop_flag:  可变对象,真值即中止(GUI 停止按钮)
+    recursive:  False 时只扫给定目录这一层, 不下潜子目录。
+                默认 True —— CLI 与老调用行为不变; 界面按需传 False。
     """
     def emit(msg):
         log(msg)
@@ -727,9 +742,10 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
     w_walk = walk_workers(dirs)
     if w_walk > 1:
         emit(f"遍历目录: {w_walk} 线程")
-    targets, unsupported = _collect_targets(dirs, w_walk, stop_flag)
+    targets, unsupported = _collect_targets(dirs, w_walk, stop_flag, recursive)
     emit(f"发现 {len(targets)} 个可解析压缩包"
          + (f",另 {len(unsupported)} 个 rar/7z 不解析" if unsupported else "")
+         + (" (不含子目录)" if not recursive else "")
          + f" (遍历耗时 {time.time() - t_walk:.1f}s)")
 
     conn = open_db(db_path)
