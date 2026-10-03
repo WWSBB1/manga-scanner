@@ -99,8 +99,8 @@ def _load_rows(db_path, names):
     conn = sqlite3.connect(db_path)
     try:
         placeholders = ",".join("?" * len(names))
-        cols = ["id", "name", "path"] + scanner.META_COLUMNS
-        sql = ("SELECT a.id, a.name, a.path, "
+        cols = ["id", "name"] + scanner.META_COLUMNS
+        sql = ("SELECT a.id, a.name, "
                + ",".join(f"m.{c}" for c in scanner.META_COLUMNS)
                + " FROM archives a LEFT JOIN meta m ON m.archive_id=a.id "
                  f"WHERE a.name IN ({placeholders})")
@@ -119,7 +119,7 @@ GROUP_DIR_CN = {
 
 
 def plan_transfer(db_path, names, base_dir, group_by="", mode="copy",
-                  entries=None, group_dir=False):
+                  entries=None, group_dir=False, paths=None):
     """生成搬移计划(不碰文件),供预览和执行共用。
 
     多值字段会扇出: 一个作品在该字段有多个值就有多个目标目录。
@@ -129,9 +129,13 @@ def plan_transfer(db_path, names, base_dir, group_by="", mode="copy",
     group_dir: True 时多包一层以字段命名的目录:
                基础目录/作者/zmix/x.zip 而不是 基础目录/zmix/x.zip。
                不同分类维度的结果就不会混在一起。
+    paths:     {name: 绝对路径} —— 文件"当下在哪"。库不记路径, 所以搬移
+               必须由调用方把本次找到的位置传进来(扫描结果或源目录扫描)。
+               缺某个 name 就认为它这次找不到, exists_src=False。
     返回 [{name, src, targets:[目录...], dest_dir, dest, exists_src, error}]
     dest_dir / dest 是第一个目标; targets 为空时两者都是 None。
     """
+    paths = paths or {}
     rows = _load_rows(db_path, names)
     by_name = {r["name"]: r for r in rows}
     limit = scanner.VALUE_FANOUT_LIMIT
@@ -164,13 +168,15 @@ def plan_transfer(db_path, names, base_dir, group_by="", mode="copy",
         else:
             targets = [base_dir]
         first = targets[0] if targets else None
+        src = paths.get(n)
         plan.append({
             "name": n,
-            "src": r.get("path"),
+            "src": src,
             "targets": targets,
             "dest_dir": first,
             "dest": os.path.join(first, n) if first else None,
-            "exists_src": os.path.isfile(r.get("path") or ""),
+            # 当场核对, 不是读库里可能过期的值
+            "exists_src": bool(src) and os.path.isfile(src),
             "artist": r.get("artist"), "parody": r.get("parody"),
             "language": r.get("language"),
         })
@@ -180,6 +186,8 @@ def plan_transfer(db_path, names, base_dir, group_by="", mode="copy",
 def match_in_db(db_path, src_dir, recursive=True):
     """列出源目录下的压缩包,只保留数据库里有记录的。
 
+    这是"文件现在在哪"的主要来源 —— 库不记路径, 搬移前先用它把
+    本次的位置扫出来({name: src}),再交给 plan_transfer。
     返回 [{name, src, dest_dir(None), exists_src:True}, ...]
     数据库中没记录的直接忽略(不处理)。
     """
@@ -215,7 +223,6 @@ def match_in_db(db_path, src_dir, recursive=True):
             continue                      # 库里没有 -> 忽略
         out.append({"name": n, "src": path, "dest_dir": None,
                     "dest": None, "exists_src": True,
-                    "db_path": r.get("path"),
                     "artist": r.get("artist"), "parody": r.get("parody"),
                     "language": r.get("language")})
     return out
@@ -223,7 +230,7 @@ def match_in_db(db_path, src_dir, recursive=True):
 
 def transfer_by_names(db_path, names, dest_dir, mode="copy", log=print,
                       progress=None, stop_flag=None, group_by="", entries=None,
-                      group_dir=False):
+                      group_dir=False, paths=None):
     """按文件名列表批量移动/复制。
 
     names:    archives.name 的列表
@@ -231,19 +238,18 @@ def transfer_by_names(db_path, names, dest_dir, mode="copy", log=print,
     group_by: 按该字段建子目录(空串则全放 dest_dir)
     entries:  {name: [值, ...]},由筛选结果决定要进哪些值目录(见 plan_transfer)
     group_dir: True 时多包一层字段名目录(基础目录/作者/值/文件)
-    移动成功后把库里的 path 更新为新位置,让后续扫描不误判"同名冲突"。
+    paths:    {name: 绝对路径},文件当下在哪。库不记路径, 必须由调用方提供。
     返回 {结果统计}, {name: 消息} 失败清单
     """
     if mode not in ("copy", "move"):
         raise ValueError(f"mode 必须是 copy/move: {mode}")
     plan = plan_transfer(db_path, names, dest_dir, group_by, mode, entries,
-                         group_dir)
+                         group_dir, paths)
     plan_by_name = {p["name"]: p for p in plan}
 
     ok = fail = skip = 0
     errors = {}
     skipped = {}
-    moved_paths = {}
     total = len(names)
     for i, n in enumerate(names, 1):
         if stop_flag is not None and stop_flag():
@@ -303,7 +309,6 @@ def transfer_by_names(db_path, names, dest_dir, mode="copy", log=print,
             success, msg = False, f"{type(e).__name__}: {e}"
         if success:
             ok += 1
-            moved_paths[n] = msg  # msg=新路径
             if len(targets) > 1:
                 extra = f" (另 {skipped_n} 个目录已存在,跳过)" if skipped_n else ""
                 log(f"  ✓ {n[:60]} -> {len(targets)} 个目录{extra}")
@@ -319,18 +324,6 @@ def transfer_by_names(db_path, names, dest_dir, mode="copy", log=print,
             log(f"  ✗ {n[:70]}: {msg}")
         if progress:
             progress(i, total)
-
-    # 移动成功的更新库里的 path(核对过新路径确实存在才更新)
-    if mode == "move" and moved_paths:
-        conn = sqlite3.connect(db_path)
-        try:
-            for n, newp in moved_paths.items():
-                if os.path.exists(newp):
-                    conn.execute("UPDATE archives SET path=? WHERE name=?",
-                                 (newp, n))
-            conn.commit()
-        finally:
-            conn.close()
 
     msg_tail = f",跳过 {skip}" if skip else ""
     log(f"完成: 成功 {ok},失败 {fail}{msg_tail},目标 {dest_dir}")

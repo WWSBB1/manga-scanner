@@ -42,7 +42,7 @@ FIELD_CN = {"name": "文件名", "artist": "作者", "parody": "原作",
             "year": "年", "month": "月", "day": "日",
             "title_original": "原标题", "other_fields": "其它字段",
             "image_count": "图片数", "size": "大小", "has_meta": "有元数据",
-            "error": "错误", "scanned_at": "扫描时间", "path": "路径",
+            "error": "错误", "scanned_at": "扫描时间",
             "entry_count": "条目数", "id": "ID", "archive_id": "归档ID"}
 
 SCAN_WORKERS = {}   # scan_id -> {running, stop, log[], stats}
@@ -178,14 +178,20 @@ class API:
 
         条目级: 一个作品的多值字段会展开成多个条目, 每个条目独立判断,
         筛选后剩下的值直接决定分类目录。
+
+        库不记路径, 所以源目录是"文件在哪"的唯一来源, 必填。
         """
         try:
+            if not src_dir:
+                return {"error": "请先填源目录 —— 库不记文件路径,"
+                                 "要知道文件在哪才能算出目标"}
+            if not os.path.isdir(src_dir):
+                return {"error": f"源目录不存在: {src_dir}"}
             entries = scanner.query_entries(DB_PATH, conditions, join,
                                             fields=[group_by], limit=limit)
-            if src_dir:
-                allowed = {i["name"] for i in
-                           fileops.match_in_db(DB_PATH, src_dir, recursive)}
-                entries = [e for e in entries if e["name"] in allowed]
+            paths = {i["name"]: i["src"] for i in
+                     fileops.match_in_db(DB_PATH, src_dir, recursive)}
+            entries = [e for e in entries if e["name"] in paths]
             # 按作品聚合成 {name: [值...]}
             by_name = {}
             for e in entries:
@@ -193,8 +199,11 @@ class API:
                 if e["value"] not in by_name[e["name"]]:
                     by_name[e["name"]].append(e["value"])
             names = list(by_name)
+            # paths 只包含源目录里真实存在的文件; 源目录没填时为空 ->
+            # exists_src 全 False, 预览会提示"找不到", 这是诚实的
             plan = fileops.plan_transfer(DB_PATH, names, base_dir, group_by,
-                                         entries=by_name, group_dir=group_dir)
+                                         entries=by_name, group_dir=group_dir,
+                                         paths=paths)
             # 预览按条目展开: 一个作品多个值就是多行
             rows = []
             for p in plan:
@@ -229,10 +238,11 @@ class API:
             try:
                 entries = scanner.query_entries(
                     DB_PATH, conditions or [], join, fields=[group_by])
+                paths = {}
                 if src_dir:
-                    allowed = {i["name"] for i in
-                               fileops.match_in_db(DB_PATH, src_dir, recursive)}
-                    entries = [e for e in entries if e["name"] in allowed]
+                    paths = {i["name"]: i["src"] for i in
+                             fileops.match_in_db(DB_PATH, src_dir, recursive)}
+                    entries = [e for e in entries if e["name"] in paths]
                 by_name = {}
                 for e in entries:
                     by_name.setdefault(e["name"], [])
@@ -241,11 +251,14 @@ class API:
                 use_names = list(by_name)
                 if not use_names:
                     log_fn("筛选后没有任何条目, 无事可做")
+                elif not paths:
+                    # 源目录没填 -> 不知道该去哪找文件, 下面每个都会报"源文件不存在"
+                    log_fn("⚠ 没填源目录, 无法定位文件 —— 库不记路径")
                 result, errs = fileops.transfer_by_names(
                     DB_PATH, use_names, dest, mode,
                     log=log_fn, progress=progress,
                     stop_flag=lambda: w["stop"], group_by=group_by,
-                    entries=by_name, group_dir=group_dir)
+                    entries=by_name, group_dir=group_dir, paths=paths)
                 w["result"] = result
                 w["errors"] = errs
             except Exception as ex:
@@ -420,6 +433,8 @@ checkbox-row{display:block;margin:4px 0}
 .cond .del{background:#ef5350;padding:6px 10px;font-size:13px;flex:0 0 auto}
 .cond-idx{font-size:11px;color:#999;width:24px;flex:0 0 auto;text-align:center}
 .dest-path{font-size:11px;color:#2e7d32;word-break:break-all}
+/* 文件名完整显示不截断, 长名字靠换行容纳 */
+#cls-table td:first-child{word-break:break-all}
 .hl{background:#fff9c4;padding:0 2px;border-radius:2px}
 .badge.mv{cursor:pointer;background:#7e57c2}
 .vlist{margin-top:4px;line-height:1.8}
@@ -880,6 +895,7 @@ function clsPayload(){
 }
 function doPreview(){
   const p=clsPayload();
+  if(!p.src_dir){alert('请填源目录 —— 库不记路径, 要知道文件在哪才能算出目标');return;}
   if(!p.base_dir){alert('请填目标基础目录');return;}
   fetch('/api/preview',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(p)})
@@ -898,18 +914,20 @@ function doPreview(){
         miss.textContent='⚠ '+d.missing.length+' 个文件在磁盘上找不到,会被跳过';
       }else{miss.textContent='';}
       const base=p.base_dir;
-      const shortName=x=>(x.name||'').slice(0,38);
+      // 文件名不截断: 完整显示, 靠 CSS 换行/横向滚动容纳(截断会让人
+      // 以为是文件名本身有问题, 也对不上磁盘上的真实文件)
+      const fullName=x=>esc(x.name||'');
       tb.innerHTML=d.plan.map(x=>{
         const tg=(x.targets&&x.targets.length)?x.targets:[x.dest_dir];
         const subOf=t=>(t&&t!==base)?t.slice(base.length).replace(/^\//,''):'(基础目录)';
-        let destHtml='<span class="hl">'+esc(subOf(tg[0]))+'</span>/'+esc(shortName(x));
+        let destHtml='<span class="hl">'+esc(subOf(tg[0]))+'</span>/'+fullName(x);
         if(tg.length>1){
           destHtml+='<br>'+tg.slice(1).map(t=>
-            '<span class="hl">'+esc(subOf(t))+'</span>/'+esc(shortName(x))).join('<br>');
+            '<span class="hl">'+esc(subOf(t))+'</span>/'+fullName(x)).join('<br>');
           destHtml+=' <span class="badge">共'+tg.length+'份</span>';
         }
         const bad=x.exists_src?'':' style="opacity:.45"';
-        return '<tr'+bad+'><td>'+esc((x.name||'').slice(0,40))+'</td>'+
+        return '<tr'+bad+'><td>'+fullName(x)+'</td>'+
           '<td class="dest-path">'+destHtml+'</td></tr>';
       }).join('')||'<tr><td colspan=2>没有匹配的文件</td></tr>';
       document.getElementById('cls-preview-card').classList.remove('hidden');

@@ -112,7 +112,8 @@ python3 test_core.py
 多少次,结果都一样,不会堆出 `xxx (1).zip` `xxx (2).zip` 一堆副本。
 移动模式下跳过的文件也不会删源。界面会显示「N 已存在被跳过」。
 
-移动会校验目标大小一致才删源,并更新库里的 path。
+移动会校验目标大小一致才删源。库不记路径,所以**源目录必填** ——
+文件在哪由它当场扫出来,用完即弃(见下面「数据库」)。
 
 ## 插件页
 
@@ -143,7 +144,13 @@ rar/7z 只统计不解析。
 
 ## 数据库
 
-`archives(name 唯一键, path, size, mtime, 原文×4, extra_json, has_meta, error...)`
+`archives(name 唯一键, size, mtime, 原文×4, extra_json, has_meta, error...)`
+
+**库里不存路径。** 路径会变(文件挪窝、外接盘换挂载点),存进去只会过期。
+位置在需要时现取:扫描时记在内存里(`scan_dirs` 返回的 `paths`),或分类前
+用源目录扫一遍(`fileops.match_in_db`),搬移完就不再关心。
+增量判断只比 `name` + `size` + `mtime`,所以文件换位置后重扫既不会
+误判成"新文件",也不会被当成"同名冲突"跳过。
 `meta_values(archive_id, field, value)` — 各字段按逗号拆分后的索引表,
 筛选/计数/分组都基于它。`meta` 表仍保留原始字符串供详情页显示。
 `meta(archive_id 主键, title, artist, group_name, parody, character, tags,

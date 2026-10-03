@@ -397,7 +397,6 @@ def scan_one(path):
 
     rec = {
         "name": os.path.basename(path),
-        "path": path,
         "size": size,
         "mtime": int(os.path.getmtime(path)),
         "entry_count": len(names),
@@ -419,7 +418,6 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS archives (
     id            INTEGER PRIMARY KEY,
     name          TEXT NOT NULL UNIQUE,   -- 文件名,增量判断的 key
-    path          TEXT NOT NULL,
     size          INTEGER,
     mtime         INTEGER,
     entry_count   INTEGER,
@@ -471,7 +469,7 @@ CREATE INDEX IF NOT EXISTS idx_mv_field_value ON meta_values(field, value);
 CREATE INDEX IF NOT EXISTS idx_mv_archive ON meta_values(archive_id);
 """
 
-ARCHIVE_COLUMNS = ["name", "path", "size", "mtime", "entry_count", "image_count",
+ARCHIVE_COLUMNS = ["name", "size", "mtime", "entry_count", "image_count",
                    "comicinfo_xml", "info_json", "meta_json", "metadata_json",
                    "extra_json", "has_meta", "scanned_at", "error"]
 
@@ -492,9 +490,28 @@ def open_db(path=DEFAULT_DB):
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    migrate_drop_path(conn)
     migrate_meta_values(conn)
     conn.commit()
     return conn
+
+
+def migrate_drop_path(conn):
+    """老库迁移: 删掉 archives.path 列。
+
+    路径不入库 —— 它随时会变(文件挪窝、外接盘换挂载点), 记在库里只会
+    过期。老库里的 path 大都已经失效, 直接丢弃; 下次扫描会重新得到位置。
+    SQLite < 3.35 不支持 DROP COLUMN, 老版本上保留该列(无害, 只是不再读写)。
+    返回 True 表示执行了删除。
+    """
+    cols = [c[1] for c in conn.execute("PRAGMA table_info(archives)")]
+    if "path" not in cols:
+        return False
+    try:
+        conn.execute("ALTER TABLE archives DROP COLUMN path")
+    except sqlite3.OperationalError:
+        return False        # SQLite 太老, 留着这列不管
+    return True
 
 
 def _upsert(conn, table, key_col, rec):
@@ -554,9 +571,12 @@ def migrate_meta_values(conn):
 
 
 def load_existing(conn):
-    """{name: (path, size, mtime, has_meta, error)}"""
-    return {n: (p, s, m, h, e) for n, p, s, m, h, e in conn.execute(
-        "SELECT name, path, size, mtime, has_meta, error FROM archives")}
+    """{name: (size, mtime, has_meta, error)}
+
+    只用来判断"内容有没有变", 与文件在哪无关 —— 路径不入库。
+    """
+    return {n: (s, m, h, e) for n, s, m, h, e in conn.execute(
+        "SELECT name, size, mtime, has_meta, error FROM archives")}
 
 
 # ---------------------------------------------------------------- 并行策略
@@ -715,26 +735,30 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
     conn = open_db(db_path)
     try:
         existing = {} if rescan else load_existing(conn)
-        todo, skip_n, conflict_n = [], 0, 0
+        todo, skip_n = [], 0
+        # 本次扫到的位置: {name: 绝对路径}。路径只是"当下在哪"的临时记忆,
+        # 供本次搬移使用; 不入库(文件挪个位置库里的路径就过期了)。
+        found_paths = {}
         for path in targets:
             name = os.path.basename(path)
+            # 同名多次出现(同名文件散在多个目录): 保留先扫到的那个。
+            # 库以 name 为唯一键, 先到先得与入库行为保持一致。
+            found_paths.setdefault(name, path)
             prev = existing.get(name)
             if prev is not None:
-                prev_path, prev_size, prev_mtime, prev_meta, prev_err = prev
-                if prev_path != path:
-                    conflict_n += 1
-                    emit(f"⚠ 同名冲突,跳过: {name}\n  已入库: {prev_path}\n  本次:   {path}")
-                    continue
+                prev_size, prev_mtime, prev_meta, prev_err = prev
                 try:
                     st_size, st_mtime = os.path.getsize(path), int(os.path.getmtime(path))
                 except OSError:
                     continue
+                # 只比内容(size/mtime), 不比路径: 文件换了位置但内容没变
+                # 依然算"没变", 不该重解析, 更不该整条跳过。
                 if (prev_err is None and prev_meta
-                        and prev_size == st_size and prev_mtime == prev_mtime):
+                        and prev_size == st_size and prev_mtime == st_mtime):
                     skip_n += 1
                     continue
             todo.append(path)
-        emit(f"待处理 {len(todo)},增量跳过 {skip_n},同名冲突 {conflict_n}")
+        emit(f"待处理 {len(todo)},增量跳过 {skip_n}")
 
         done = fail = 0
         failures = []
@@ -759,7 +783,7 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
                 fail += 1
                 failures.append((name, err))
                 _upsert(conn, "archives", "name", {
-                    "name": name, "path": path,
+                    "name": name,
                     "scanned_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "error": err,
                 })
@@ -797,8 +821,10 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
         if failures:
             emit(f"失败 {len(failures)} 个(下次自动重试)")
         return {"total": len(targets), "todo": len(todo), "done": done,
-                "fail": fail, "skip": skip_n, "conflict": conflict_n,
-                "unsupported": unsupported, "elapsed": el}
+                "fail": fail, "skip": skip_n,
+                "unsupported": unsupported, "elapsed": el,
+                # 本次扫到的位置, 供调用方当场搬移用(库不存路径)
+                "paths": found_paths}
     finally:
         conn.close()
 
@@ -809,10 +835,10 @@ def list_archives(db_path=DEFAULT_DB, where="1=1", args=(), limit=2000):
     """archives JOIN meta,返回字段名列表 + 行列表。"""
     conn = sqlite3.connect(db_path)
     try:
-        cols = ["id", "name", "path", "size", "image_count", "has_meta",
+        cols = ["id", "name", "size", "image_count", "has_meta",
                 "error"] + META_COLUMNS
         sql = ("SELECT a." + ",".join(
-                   c if c in ("id", "name", "path", "size", "image_count",
+                   c if c in ("id", "name", "size", "image_count",
                               "has_meta", "error") else f"m.{c}"
                    for c in cols)
                + " FROM archives a LEFT JOIN meta m ON m.archive_id=a.id "
@@ -1104,7 +1130,8 @@ def query_entries(db_path=DEFAULT_DB, conditions=None, join="and",
     这个条目, 同作品的 bob/carol 照常保留。
 
     fields: 限定返回哪些字段的条目; None 表示全部 MULTI_FIELDS。
-    返回 [{archive_id, name, path, field, value, meta}], 按 name/field/value 排序。
+    返回 [{archive_id, name, field, value, meta}], 按 name/field/value 排序。
+    不含路径 —— 库不记路径, 需要路径请用本次扫描结果或源目录扫描。
     """
     conditions = list(conditions or [])
     narrow = narrow_values(db_path, conditions, join)
@@ -1119,8 +1146,8 @@ def query_entries(db_path=DEFAULT_DB, conditions=None, join="and",
 
     conn = sqlite3.connect(db_path)
     try:
-        cols = ["id", "name", "path"] + META_COLUMNS
-        sql = ("SELECT a.id, a.name, a.path, "
+        cols = ["id", "name"] + META_COLUMNS
+        sql = ("SELECT a.id, a.name, "
                + ",".join(f"m.{c}" for c in META_COLUMNS)
                + " FROM archives a LEFT JOIN meta m ON m.archive_id=a.id "
                  f"WHERE {where} ORDER BY a.name")
@@ -1167,7 +1194,7 @@ def query_entries(db_path=DEFAULT_DB, conditions=None, join="and",
                 vals = vals_by.get((aid, f), [])
             for v in vals:
                 out.append({"archive_id": aid, "name": d["name"],
-                            "path": d["path"], "field": f, "value": v,
+                            "field": f, "value": v,
                             "meta": meta})
         if len(out) >= limit:
             break
