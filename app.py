@@ -48,6 +48,11 @@ FIELD_CN = {"name": "文件名", "artist": "作者", "parody": "原作",
 SCAN_WORKERS = {}   # scan_id -> {running, stop, log[], stats}
 CLS_WORKERS = {}    # cls_id -> {running, stop, log[], result}
 
+# 最近一次扫描扫到的文件名。浏览页默认只看这批 ——
+# 库里可能堆着几万条历史记录, 但用户此刻关心的是"刚扫的这批"。
+# 不用 scanned_at 判断: 增量跳过的记录不会刷新它, 靠它筛不出"本次扫到"。
+LAST_SCAN = {"names": None, "dirs": [], "at": None}
+
 
 def fmt_size(n):
     if not n:
@@ -82,6 +87,12 @@ class API:
                     progress=progress,
                     stop_flag=lambda: w["stop"], recursive=recursive)
                 w["stats"] = stats
+                # 记下这次扫到的文件名(连"没扫完就停"的那部分也算),
+                # 浏览页默认只看这批
+                if "names" in stats:
+                    LAST_SCAN["names"] = stats["names"]
+                    LAST_SCAN["dirs"] = list(dirs)
+                    LAST_SCAN["at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             except Exception as ex:
                 w["stats"] = {"error": str(ex)}
             finally:
@@ -108,22 +119,37 @@ class API:
         return {"error": "无效 scan_id"}
 
     @staticmethod
-    def distinct(field):
+    def scope_names(scope="scan"):
+        """浏览页该看哪些文件: None=全库, 列表=本次扫描到的那些。
+
+        scope="scan"(默认) 只看本次扫描扫到的; "all" 看全库。
+        还没扫过时 LAST_SCAN["names"] 是 None —— 这时不假装有范围,
+        否则浏览页会永远空着, 点"全部库"又是另一个极端。
+        """
+        if scope == "all":
+            return None
+        return LAST_SCAN["names"]
+
+    @staticmethod
+    def distinct(field, scope="scan"):
         try:
-            vals = scanner.distinct_values(DB_PATH, field)
+            vals = scanner.distinct_values(DB_PATH, field,
+                                           names=API.scope_names(scope))
             return {"values": [{"value": v, "count": c} for v, c in vals]}
         except Exception as ex:
             return {"error": str(ex)}
 
     @staticmethod
-    def query(field, value, contains, limit=2000):
+    def query(field, value, contains, limit=2000, scope="scan"):
         where, args = "1=1", []
         if contains and field:
             where, args = f"m.{field} LIKE ?", [f"%{contains}%"]
         elif value and field:
             where, args = f"m.{field} = ?", [value]
         try:
-            cols, rows = scanner.list_archives(DB_PATH, where, args, limit)
+            names = API.scope_names(scope)
+            cols, rows = scanner.list_archives(DB_PATH, where, args, limit,
+                                               names=names)
             # 多值字段的条目数, 供前端显示 [N] 徽标
             conn = sqlite3.connect(DB_PATH)
             try:
@@ -482,6 +508,13 @@ checkbox-row{display:block;margin:4px 0}
 <h2>🔍 浏览数据</h2>
 <div class="card">
   <div class="row">
+    <select id="browse-scope" onchange="onScopeChange()">
+      <option value="scan">本次扫描到的</option>
+      <option value="all">全部库</option>
+    </select>
+    <span id="browse-scope-hint" style="font-size:12px;color:#666"></span>
+  </div>
+  <div class="row">
     <select id="browse-field" onchange="loadDistinct()">
       <option value="artist">作者</option>
       <option value="group_name">社团</option>
@@ -563,8 +596,8 @@ checkbox-row{display:block;margin:4px 0}
 <div class="card">
   <b>4. 执行</b>
   <div class="row" style="margin-top:8px">
-    <label><input type="radio" name="mode" value="copy" checked> 复制</label>
-    <label><input type="radio" name="mode" value="move"> 移动</label>
+    <label><input type="radio" name="mode" value="copy"> 复制</label>
+    <label><input type="radio" name="mode" value="move" checked> 移动</label>
     <label><input type="checkbox" id="cls-preview" checked> 先预览</label>
   </div>
   <div class="row">
@@ -671,6 +704,8 @@ function showPage(p){
   document.getElementById('nav-'+p).classList.add('active');
   // 统计页首次进入自动加载, 不用手动点刷新
   if(p==='stats'&&!statsLoaded)loadStats();
+  // 浏览页同理: 进来就按当前范围(默认"本次扫描到的")显示
+  if(p==='browse'){loadScopeHint();loadDistinct();doQuery();}
 }
 showPage('scan');
 
@@ -718,9 +753,25 @@ function pollScan(){
 }
 
 // ---- 浏览 ----
+function browseScope(){return document.getElementById('browse-scope').value}
+function onScopeChange(){loadScopeHint();loadDistinct();doQuery();}
+function loadScopeHint(){
+  fetch('/api/scope').then(r=>r.json()).then(d=>{
+    const el=document.getElementById('browse-scope-hint');
+    if(browseScope()==='all'){
+      el.textContent=d.scan_count!=null
+        ? '(全库; 上次扫描到 '+d.scan_count+' 个)' : '(全库)';
+    }else if(d.scan_count==null){
+      el.textContent='(还没扫描过, 先到「扫描」页跑一次)';
+    }else{
+      el.textContent='(上次扫描 '+d.at+' 扫到 '+d.scan_count+' 个)';
+    }
+  });
+}
 function loadDistinct(){
   const f=document.getElementById('browse-field').value;
-  fetch('/api/distinct?field='+f).then(r=>r.json()).then(d=>{
+  fetch('/api/distinct?'+new URLSearchParams({field:f,scope:browseScope()}))
+    .then(r=>r.json()).then(d=>{
     const sel=document.getElementById('browse-value');
     sel.innerHTML='<option value="">(全部)</option>'+
       d.values.map(v=>'<option value="'+esc(v.value)+'">'+esc(v.value)+' ('+v.count+')</option>').join('');
@@ -730,7 +781,8 @@ function doQuery(){
   const f=document.getElementById('browse-field').value;
   const v=document.getElementById('browse-value').value;
   const c=document.getElementById('browse-contains').value;
-  fetch('/api/query?'+new URLSearchParams({field:f,value:v,contains:c}))
+  fetch('/api/query?'+new URLSearchParams({field:f,value:v,contains:c,
+                                           scope:browseScope()}))
     .then(r=>r.json()).then(d=>{
       const tb=document.querySelector('#browse-table tbody');
       document.getElementById('browse-count').textContent=d.count+' 条';
@@ -882,7 +934,8 @@ function collectConds(){
   });
   return out;
 }
-addCond();
+// 不预置条件行: 空条件(值没填)会被当成 artist = '' 从而把结果滤成 0 条,
+// 看着就像"什么都没匹配到"。要筛自己点「+ 添加条件」。
 updateDestHint();
 
 // ---- 分类: 预览与执行 ----
@@ -1195,19 +1248,26 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/distinct":
             field = qs.get("field", [""])[0]
+            scope = qs.get("scope", ["scan"])[0]
             if field not in VALID_FIELDS:
                 self._json({"error": f"非法字段: {field}"})
                 return
-            self._json(API.distinct(field))
+            self._json(API.distinct(field, scope))
             return
         if path == "/api/query":
             field = qs.get("field", [""])[0]
             value = qs.get("value", [""])[0]
             contains = qs.get("contains", [""])[0]
+            scope = qs.get("scope", ["scan"])[0]
             if field and field not in VALID_FIELDS:
                 self._json({"error": f"非法字段: {field}"})
                 return
-            self._json(API.query(field, value, contains))
+            self._json(API.query(field, value, contains, scope=scope))
+            return
+        if path == "/api/scope":
+            n = LAST_SCAN["names"]
+            self._json({"scan_count": (len(n) if n is not None else None),
+                        "dirs": LAST_SCAN["dirs"], "at": LAST_SCAN["at"]})
             return
         if path == "/api/detail":
             name = qs.get("name", [""])[0]

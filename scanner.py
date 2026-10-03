@@ -856,25 +856,60 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
                 "nometa": nometa,
                 "unsupported": unsupported, "elapsed": el,
                 # 本次扫到的位置, 供调用方当场搬移用(库不存路径)
-                "paths": found_paths}
+                "paths": found_paths,
+                # 本次扫到的文件名(顺序=扫描顺序, 已去重)。浏览页靠它把
+                # 结果收窄到"这次扫到的那些", 不靠 scanned_at ——
+                # 增量跳过的记录不会刷新 scanned_at。
+                "names": list(found_paths)}
     finally:
         conn.close()
 
 
 # ---------------------------------------------------------------- 查询(GUI 用)
 
-def list_archives(db_path=DEFAULT_DB, where="1=1", args=(), limit=2000):
-    """archives JOIN meta,返回字段名列表 + 行列表。"""
+def scope_clause(conn, names):
+    """把"只看这批文件名"变成可直接拼进 WHERE 的条件, 返回 SQL 片段。
+
+    names 为 None  -> 不设范围(全库), 返回 "1=1"
+    names 为空列表 -> **空范围**, 返回 "1=0"。这个区别很要紧: 浏览页在
+                      "还没扫描过"时该是空的, 绝不能退化成把全库倒出来。
+    names 非空     -> 建临时表装名单, 返回 "a.name IN (SELECT name FROM _scope)"
+
+    走临时表而不是 IN (?,?,...): 一次扫描可能有几万个文件名, 拼进 SQL 会
+    撞上 SQLite 的参数个数上限, 长 SQL 本身也慢。
+    """
+    if names is None:
+        return "1=1"
+    uniq = list(dict.fromkeys(names))        # 去重(保序), 顺带避免重复插入
+    if not uniq:
+        return "1=0"
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS _scope "
+                 "(name TEXT PRIMARY KEY)")
+    conn.execute("DELETE FROM _scope")
+    conn.executemany("INSERT OR IGNORE INTO _scope (name) VALUES (?)",
+                     [(n,) for n in uniq])
+    return "a.name IN (SELECT name FROM _scope)"
+
+
+def list_archives(db_path=DEFAULT_DB, where="1=1", args=(), limit=2000,
+                  names=None):
+    """archives JOIN meta,返回字段名列表 + 行列表。
+
+    names: 只看这批文件名(None=全库; 空列表=一条都不给)。浏览页用它把
+           结果收窄到"本次扫描到的那些"。
+    """
     conn = sqlite3.connect(db_path)
     try:
         cols = ["id", "name", "size", "image_count", "has_meta",
                 "error"] + META_COLUMNS
+        scope = scope_clause(conn, names)
         sql = ("SELECT a." + ",".join(
                    c if c in ("id", "name", "size", "image_count",
                               "has_meta", "error") else f"m.{c}"
                    for c in cols)
                + " FROM archives a LEFT JOIN meta m ON m.archive_id=a.id "
-                 f"WHERE {where} ORDER BY a.name LIMIT {int(limit)}")
+                 f"WHERE ({where}) AND ({scope}) "
+                 f"ORDER BY a.name LIMIT {int(limit)}")
         rows = conn.execute(sql, args).fetchall()
         return cols, rows
     finally:
@@ -929,11 +964,12 @@ def _to_int(v, what="阈值"):
 
 
 def count_groups(db_path, field, min_count=0, max_count=0,
-                 base_conditions=None, join="and"):
+                 base_conditions=None, join="and", names=None):
     """按字段的拆分值分组计数,返回作品数达标的值列表。
 
     base_conditions: 先按这些条件圈定候选作品(数量条件与它们取交集)
     min_count / max_count: 0 表示不限;两个都是 0 时至少要求 1 个作品
+    names: 只看这批文件名(None=全库; 空列表=一条都不给)
     """
     if field not in VALID_FIELDS:
         raise ValueError(f"非法字段: {field}")
@@ -942,9 +978,10 @@ def count_groups(db_path, field, min_count=0, max_count=0,
     where, args = build_where(base_conditions or [], join)
     conn = sqlite3.connect(db_path)
     try:
+        scope = scope_clause(conn, names)
         sql = ("SELECT mv.value, COUNT(DISTINCT mv.archive_id) c "
                "FROM meta_values mv JOIN archives a ON a.id=mv.archive_id "
-               f"WHERE mv.field=? AND ({where}) "
+               f"WHERE mv.field=? AND ({where}) AND ({scope}) "
                "GROUP BY mv.value")
         params = [field] + list(args)
         if hi:
@@ -984,6 +1021,12 @@ def build_where(conditions, join="and"):
             raise ValueError(f"非法字段: {field}")
         if op not in VALID_OPS:
             raise ValueError(f"非法操作符: {op}")
+        # 需要值的操作符遇到空值 -> 当作没填, 整条忽略。
+        # 否则会变成 `artist = ''`, 把结果滤成 0 条 —— 界面上一片空白,
+        # 看着像"没有匹配", 其实只是条件行没填完。
+        if op not in ("empty", "not_empty"):
+            if value is None or str(value).strip() == "":
+                continue
         if op == "empty":
             parts.append(
                 "NOT EXISTS (SELECT 1 FROM meta_values mv "
@@ -1014,6 +1057,10 @@ def build_where(conditions, join="and"):
                 "NOT EXISTS (SELECT 1 FROM meta_values mv "
                 "WHERE mv.archive_id=a.id AND mv.field=? AND mv.value LIKE ?)")
             args += [field, f"%{value}%"]
+    if not parts:
+        # 全是没填完的条件 -> 等于没条件。不能返回空串: 拼进 SQL 会变成
+        # "WHERE () AND (...)", 直接语法错误。
+        return "1=1", []
     glue = f" {join.upper()} "
     return glue.join(parts), args
 
@@ -1265,16 +1312,23 @@ def group_subdir(meta_row, group_by, fallback="未分类"):
     return s or fallback
 
 
-def distinct_values(db_path=DEFAULT_DB, field="artist", limit=500):
-    """某字段的去重值列表(GUI 下拉框用),按出现次数降序。"""
+def distinct_values(db_path=DEFAULT_DB, field="artist", limit=500, names=None):
+    """某字段的去重值列表(GUI 下拉框用),按出现次数降序。
+
+    names: 只看这批文件名(None=全库; 空列表=一条都不给)。浏览页的
+           下拉框跟着"本次扫描到的"走, 才不会列出当前范围里没有的值。
+    """
     valid = set(META_COLUMNS) | {"language", "category"}
     if field not in valid:
         raise ValueError(f"非法字段: {field}")
     conn = sqlite3.connect(db_path)
     try:
+        scope = scope_clause(conn, names)
         rows = conn.execute(
             f"SELECT m.{field}, COUNT(*) FROM meta m "
+            f"JOIN archives a ON a.id = m.archive_id "
             f"WHERE m.{field} IS NOT NULL AND m.{field} != '' "
+            f"AND ({scope}) "
             f"GROUP BY m.{field} ORDER BY 2 DESC LIMIT {int(limit)}").fetchall()
         return rows
     finally:
