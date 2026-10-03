@@ -427,7 +427,7 @@ CREATE TABLE IF NOT EXISTS archives (
     meta_json     TEXT,
     metadata_json TEXT,
     extra_json    TEXT,                   -- 其它元数据文件 {文件名: 原文}
-    has_meta      INTEGER DEFAULT 0,      -- 1=有归一化元数据;0=下次还要重读
+    has_meta      INTEGER DEFAULT 0,      -- 1=解析出了元数据;0=zip 里没有元数据文件
     scanned_at    TEXT,
     error         TEXT
 );
@@ -574,6 +574,7 @@ def load_existing(conn):
     """{name: (size, mtime, has_meta, error)}
 
     只用来判断"内容有没有变", 与文件在哪无关 —— 路径不入库。
+    has_meta 只用于统计"多少文件没元数据", 不参与是否重读的判断。
     """
     return {n: (s, m, h, e) for n, s, m, h, e in conn.execute(
         "SELECT name, size, mtime, has_meta, error FROM archives")}
@@ -751,7 +752,7 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
     conn = open_db(db_path)
     try:
         existing = {} if rescan else load_existing(conn)
-        todo, skip_n = [], 0
+        todo, skip_n, skipped_nometa = [], 0, 0
         # 本次扫到的位置: {name: 绝对路径}。路径只是"当下在哪"的临时记忆,
         # 供本次搬移使用; 不入库(文件挪个位置库里的路径就过期了)。
         found_paths = {}
@@ -769,14 +770,22 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
                     continue
                 # 只比内容(size/mtime), 不比路径: 文件换了位置但内容没变
                 # 依然算"没变", 不该重解析, 更不该整条跳过。
-                if (prev_err is None and prev_meta
+                #
+                # 也不看 has_meta: 元数据是存在 zip 里的, 事后补进去必然
+                # 改变 size/mtime, 靠内容比对就能发现。内容没变还重读,
+                # 结果必然和上次一样, 纯属白读(曾有 45 个文件每次全量重读)。
+                if (prev_err is None
                         and prev_size == st_size and prev_mtime == st_mtime):
                     skip_n += 1
+                    if not prev_meta:
+                        skipped_nometa += 1
                     continue
             todo.append(path)
-        emit(f"待处理 {len(todo)},增量跳过 {skip_n}")
+        emit(f"待处理 {len(todo)},增量跳过 {skip_n}"
+             + (f"(其中 {skipped_nometa} 个解析不出元数据, 内容没变不再重读)"
+                if skipped_nometa else ""))
 
-        done = fail = 0
+        done = fail = nometa = 0
         failures = []
         t0 = time.time()
         n_workers = workers if workers is not None else worker_count(dirs)
@@ -793,7 +802,7 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
 
         def consume(path, rec, err, i):
             """把一条解析结果写库。返回 True 表示已中止。"""
-            nonlocal done, fail
+            nonlocal done, fail, nometa
             name = os.path.basename(path)
             if err is not None:
                 fail += 1
@@ -807,7 +816,10 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
             else:
                 save(conn, rec)
                 if not rec["has_meta"]:
-                    emit(f"  ○ {name[:70]} (无元数据,下次将重读)")
+                    # 解析成功(能读、没报错)但里面没有元数据文件。
+                    # 内容不变就不会再重读 —— 重读结果必然一样。
+                    nometa += 1
+                    emit(f"  ○ {name[:70]} (解析不出元数据,已入库)")
                 done += 1
             if i % 10 == 0 or i == len(todo):
                 conn.commit()
@@ -833,11 +845,15 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
                     consume(path, rec, err, i)
         conn.commit()
         el = time.time() - t0
-        emit(f"完成: 成功 {done},失败 {fail},跳过 {skip_n},耗时 {el:.1f}s")
+        emit(f"完成: 成功 {done}"
+             + (f"(其中 {nometa} 个解析不出元数据)" if nometa else "")
+             + f",失败 {fail},跳过 {skip_n},耗时 {el:.1f}s")
         if failures:
             emit(f"失败 {len(failures)} 个(下次自动重试)")
         return {"total": len(targets), "todo": len(todo), "done": done,
                 "fail": fail, "skip": skip_n,
+                # 解析成功但里面没有元数据文件的个数(它们也在 done 里)
+                "nometa": nometa,
                 "unsupported": unsupported, "elapsed": el,
                 # 本次扫到的位置, 供调用方当场搬移用(库不存路径)
                 "paths": found_paths}
