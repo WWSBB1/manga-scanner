@@ -291,9 +291,16 @@ class API:
             return {"error": str(ex)}
 
     @staticmethod
-    def classify_go(names, dest, mode, group_by="", src_dir=None,
+    def classify_go(approved, dest, mode, group_by="", src_dir=None,
                     recursive=False, conditions=None, join="and",
                     group_dir=False):
+        """approved: 用户在预览里确认过的那批文件名(必传)。
+
+        移动不可逆, 所以把它当作**上界**: 实际只处理"条件筛出来的"与
+        "用户确认过的"交集。用户在预览后又改了条件时, 服务端重新推导的
+        集合会比确认框里说的大 —— 那就可能搬走没给他看过、没经他确认
+        的文件。取交集保证只会更少, 不会更多。
+        """
         cid = f"cls_{int(time.time())}"
         w = {"running": True, "stop": False, "log": [], "result": None}
         CLS_WORKERS[cid] = w
@@ -336,6 +343,16 @@ class API:
                     for n in fallback:
                         by_name.setdefault(n, [])
                 use_names = list(by_name)
+                if approved:
+                    allowed = set(approved)
+                    dropped = [n for n in use_names if n not in allowed]
+                    use_names = [n for n in use_names if n in allowed]
+                    if dropped:
+                        log_fn(f"⚠ {len(dropped)} 个文件不在预览确认的范围内, "
+                               "已排除(预览后条件被改过?)")
+                    by_name = {n: v for n, v in by_name.items() if n in allowed}
+                    # fallback 也要一起收窄, 否则会被重新塞回 by_name
+                    fallback = [n for n in fallback if n in allowed]
                 if not use_names:
                     log_fn("筛选后没有任何条目, 无事可做")
                 result, errs = fileops.transfer_by_names(
@@ -1075,10 +1092,13 @@ function doClassify(){
     if(!confirm('确定要移动 '+names.length+' 个文件吗?'+extra+
         '\n原位置的文件会被删除,此操作不可撤销。'))return;
   }
+  // names 一并送过去: 服务端用它当上界。上面确认框说的是"移动 N 个",
+  // 若预览后条件被改过, 服务端重新推导的集合会更大 —— 那就可能搬走
+  // 用户没看过、没确认过的文件。取交集保证只会更少。
   fetch('/api/classify',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({dest:p.base_dir,mode:p.mode,group_by:p.group_by,
       src_dir:p.src_dir,recursive:p.recursive,group_dir:p.group_dir,
-      conditions:p.conditions,join:p.join})})
+      conditions:p.conditions,join:p.join,names:names})})
     .then(r=>r.json()).then(d=>{
       if(d.error){alert('执行失败: '+d.error);return;}
       clsId=d.cls_id;
