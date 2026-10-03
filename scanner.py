@@ -111,24 +111,37 @@ def _decode(data):
     return data.decode("utf-8", "replace")
 
 
-def split_values(raw):
+# 各字段自己的"等于没填"取值。original 是"原创作品"(不是同人),
+# 对"原作"这个维度而言就等于没有原作 —— 按原作分类时它该进「未分类」,
+# 而不是单独占一个 original 目录(库里有 1.2 万条, 会盖过所有真实原作)。
+FIELD_BLANK_VALUES = {
+    "parody": {"original"},
+}
+
+
+def split_values(raw, field=None):
     """把一个字段的原始值拆成多个独立值。
 
     分隔符是逗号(兼容全角),去空白、去重、丢弃空项。
     None / 空串 / 纯空白都返回空列表。
     占位符(Unknown)也丢弃 —— 它只表示"未知",不是真实取值。
+    field: 传了字段名就额外套用该字段的 FIELD_BLANK_VALUES。
     """
     if raw is None:
         return []
     s = str(raw)
     for sep in _VALUE_SEPS[1:]:
         s = s.replace(sep, _VALUE_SEPS[0])
+    blanks = FIELD_BLANK_VALUES.get(field, ()) if field else ()
     out, seen = [], set()
     for part in s.split(_VALUE_SEPS[0]):
         v = part.strip()
-        if v and v not in seen and not _is_placeholder(v):
-            seen.add(v)
-            out.append(v)
+        if not v or v in seen or _is_placeholder(v):
+            continue
+        if v.lower() in blanks:
+            continue
+        seen.add(v)
+        out.append(v)
     return out
 
 
@@ -544,7 +557,7 @@ def _save_meta_values(conn, archive_id, meta_row):
         return
     rows = []
     for field in MULTI_FIELDS:
-        for v in split_values(meta_row.get(field)):
+        for v in split_values(meta_row.get(field), field):
             rows.append((archive_id, field, v))
     if rows:
         conn.executemany(
@@ -1201,7 +1214,7 @@ def narrow_values(db_path, conditions, join="and"):
 
 
 def query_entries(db_path=DEFAULT_DB, conditions=None, join="and",
-                  fields=None, limit=5000):
+                  fields=None, limit=5000, names=None):
     """按条件筛选, 返回**条目级**结果。
 
     条目 = (作品, 字段, 值)。多值字段一个作品会展开成多个条目,
@@ -1209,6 +1222,10 @@ def query_entries(db_path=DEFAULT_DB, conditions=None, join="and",
     这个条目, 同作品的 bob/carol 照常保留。
 
     fields: 限定返回哪些字段的条目; None 表示全部 MULTI_FIELDS。
+    names:  只看这批文件名(None=全库; 空列表=一条都不给)。**必须在 SQL
+            层收窄**, 不能取完再筛: limit 是按 name 排序取前 N 条, 而
+            目标文件的名字可能排在几万名开外, 那样会被截断掉, 界面就
+            显示"没有可分类的"(曾因此在 4 万条库里只能分类到 0 个)。
     返回 [{archive_id, name, field, value, meta}], 按 name/field/value 排序。
     不含路径 —— 库不记路径, 需要路径请用本次扫描结果或源目录扫描。
     """
@@ -1225,14 +1242,20 @@ def query_entries(db_path=DEFAULT_DB, conditions=None, join="and",
 
     conn = sqlite3.connect(db_path)
     try:
+        scope = scope_clause(conn, names)
         cols = ["id", "name"] + META_COLUMNS
         sql = ("SELECT a.id, a.name, "
                + ",".join(f"m.{c}" for c in META_COLUMNS)
                + " FROM archives a LEFT JOIN meta m ON m.archive_id=a.id "
-                 f"WHERE {where} ORDER BY a.name")
+                 f"WHERE ({where}) AND ({scope}) ORDER BY a.name")
         rows = conn.execute(sql, args).fetchall()
-        mv_rows = conn.execute(
-            "SELECT archive_id, field, value FROM meta_values").fetchall()
+        # 收窄时把 meta_values 也一起收窄: 否则每次都要把 100 多万行
+        # 全读一遍, 而真正用到的只是范围内那几十个作品的条目。
+        mv_sql = "SELECT mv.archive_id, mv.field, mv.value FROM meta_values mv"
+        if names is not None:
+            mv_sql += (" JOIN archives a ON a.id = mv.archive_id"
+                       f" WHERE {scope}")
+        mv_rows = conn.execute(mv_sql).fetchall()
     finally:
         conn.close()
 

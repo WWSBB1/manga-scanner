@@ -149,6 +149,12 @@ zip 内: `ComicInfo.xml` / `info.json` / `meta.json` / `metadata.json`。
 ComicInfo 其余标签存 `other_fields` JSON 列。
 rar/7z 只统计不解析。
 
+**占位值当空**(见 `PLACEHOLDERS` / `FIELD_BLANK_VALUES`):
+- 任意字段的 `Unknown` / `N/A` / `None` / `Null` —— 下载器填的"未知",不是真实取值。
+- **原作字段的 `original`** —— 原创作品(非同人),对"原作"维度就等于没有原作,
+  按原作分类时落到「未分类」,而不是单独占一个 original 目录。
+  只精确匹配整值: `last origin`(手游 Last Origin)是真实作品,不受影响。
+
 ## 数据库
 
 `archives(name 唯一键, size, mtime, 原文×4, extra_json, has_meta, error...)`

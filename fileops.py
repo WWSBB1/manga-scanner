@@ -151,7 +151,9 @@ def plan_transfer(db_path, names, base_dir, group_by="", mode="copy",
             if entries is not None:
                 vals = list(entries.get(n) or [])
             else:
-                vals = scanner.split_values(r.get(group_by))
+                # 传字段名, 让该字段的"等于没填"取值(如 parody 的 original)
+                # 也在这里生效
+                vals = scanner.split_values(r.get(group_by), group_by)
             # 筛选结果([] 也是有效结果)不套用"未分类"兜底; 旧行为才兜底
             vals = vals[:limit] or ([] if entries is not None else ["未分类"])
             # 包一层字段名目录(如 作者/、标签/)

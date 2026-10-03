@@ -213,11 +213,15 @@ class API:
                                  "要知道文件在哪才能算出目标"}
             if not os.path.isdir(src_dir):
                 return {"error": f"源目录不存在: {src_dir}"}
-            entries = scanner.query_entries(DB_PATH, conditions, join,
-                                            fields=[group_by], limit=limit)
+            # 先拿到源目录里都有哪些文件, 再让查询**在 SQL 层**按这个
+            # 名单收窄。顺序不能反: 查询有 limit(按 name 排序取前 N),
+            # 先查全库再过滤的话, 名字排在后面的目标会被 limit 截掉,
+            # 界面就报"没有可分类的"。
             paths = {i["name"]: i["src"] for i in
                      fileops.match_in_db(DB_PATH, src_dir, recursive)}
-            entries = [e for e in entries if e["name"] in paths]
+            entries = scanner.query_entries(DB_PATH, conditions, join,
+                                            fields=[group_by], limit=limit,
+                                            names=list(paths))
             # 按作品聚合成 {name: [值...]}
             by_name = {}
             for e in entries:
@@ -262,13 +266,14 @@ class API:
 
         def worker():
             try:
-                entries = scanner.query_entries(
-                    DB_PATH, conditions or [], join, fields=[group_by])
                 paths = {}
                 if src_dir:
                     paths = {i["name"]: i["src"] for i in
                              fileops.match_in_db(DB_PATH, src_dir, recursive)}
-                    entries = [e for e in entries if e["name"] in paths]
+                # 同样在 SQL 层按源目录收窄, 免得被 limit 截断
+                entries = scanner.query_entries(
+                    DB_PATH, conditions or [], join, fields=[group_by],
+                    names=(list(paths) if src_dir else None))
                 by_name = {}
                 for e in entries:
                     by_name.setdefault(e["name"], [])
