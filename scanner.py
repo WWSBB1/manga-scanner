@@ -824,9 +824,12 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
         found_paths = {}
         for path in targets:
             name = os.path.basename(path)
-            # 同名多次出现(同名文件散在多个目录): 保留先扫到的那个。
-            # 库以 name 为唯一键, 先到先得与入库行为保持一致。
-            found_paths.setdefault(name, path)
+            # 同名多次出现(同名文件散在多个目录): 取**最后**扫到的那个。
+            # 必须与入库口径一致 —— 库里以 name 为唯一键, 后写的记录覆盖
+            # 先写的, 所以库里的元数据来自最后一个。这里若取第一个,
+            # 预览显示的元数据(A的)和实际搬移的文件(B的)就不是同一份,
+            # 而且每次重扫可能换一个。
+            found_paths[name] = path
             prev = existing.get(name)
             if prev is not None:
                 prev_size, prev_mtime, prev_meta, prev_err = prev

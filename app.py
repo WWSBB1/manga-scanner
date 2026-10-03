@@ -862,7 +862,7 @@ function doQuery(){
           return esc(raw.length>maxLen?raw.slice(0,maxLen)+'…':raw);
         };
         return '<tr onclick="showDetail('+JSON.stringify(m.name)+')">'+
-          '<td>'+esc((m.name||'').slice(0,40))+'</td>'+
+          '<td>'+esc(m.name||'')+'</td>'+
           '<td>'+cell('artist',20)+'</td>'+
           '<td>'+cell('parody',20)+'</td>'+
           '<td>'+esc(m.language||'')+'</td>'+
@@ -1230,14 +1230,17 @@ function statToBrowse(val){
   document.getElementById('stats-drill-title').textContent=
     (FIELD_CN_STAT[statField]||statField)+' = '+val;
   document.getElementById('stats-drill-body').innerHTML='<p>加载中…</p>';
-  fetch('/api/query?'+new URLSearchParams({field:statField,value:val,contains:''}))
+  // 统计数字是全库的, 下钻也必须查全库 —— 不传 scope 会默认成"本次扫描",
+  // 扫描范围之外的作品就会显示 0 条, 跟上面那条分布条自相矛盾
+  fetch('/api/query?'+new URLSearchParams({field:statField,value:val,
+                                           contains:'',scope:'all'}))
     .then(r=>r.json()).then(d=>{
       if(d.error){document.getElementById('stats-drill-body').innerHTML='<p>'+esc(d.error)+'</p>';return;}
       const rows=d.rows.map(r=>{
         const m=cols2obj(d.columns,r);
         return '<tr onclick="showDetail('+JSON.stringify(m.name)+')">'+
-          '<td>'+esc((m.name||'').slice(0,42))+'</td>'+
-          '<td>'+esc((m.artist||'').slice(0,18))+'</td>'+
+          '<td>'+esc(m.name||'')+'</td>'+
+          '<td>'+esc(m.artist||'')+'</td>'+
           '<td>'+esc(m.language||'')+'</td>'+
           '<td>'+(m.page_count||'')+'</td></tr>';
       }).join('');
