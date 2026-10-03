@@ -514,17 +514,59 @@ def migrate_drop_path(conn):
 
     路径不入库 —— 它随时会变(文件挪窝、外接盘换挂载点), 记在库里只会
     过期。老库里的 path 大都已经失效, 直接丢弃; 下次扫描会重新得到位置。
-    SQLite < 3.35 不支持 DROP COLUMN, 老版本上保留该列(无害, 只是不再读写)。
-    返回 True 表示执行了删除。
+
+    必须真的删掉, 不能"删不掉就算了": 老库里 path 是 NOT NULL, 而写入
+    早已不再提供这一列, 留着它每一次入库都会报 NOT NULL 约束失败,
+    整个扫描中断。SQLite < 3.35 没有 DROP COLUMN, 就走重建表。
+
+    返回 True 表示执行了迁移。
     """
     cols = [c[1] for c in conn.execute("PRAGMA table_info(archives)")]
     if "path" not in cols:
         return False
     try:
         conn.execute("ALTER TABLE archives DROP COLUMN path")
+        return True
     except sqlite3.OperationalError:
-        return False        # SQLite 太老, 留着这列不管
-    return True
+        pass                    # 老版本 / 有索引引用 -> 走重建表
+
+    # 重建表: 建新的(无 path), 拷数据, 换名。
+    # archives 被 meta / meta_values 用外键引用, 期间要关掉外键检查,
+    # 否则换名会连带改动子表里的引用。
+    old_cols = ",".join(c for c in cols if c != "path")
+    # meta / meta_values 用外键指向 archives, 换表期间必须关掉外键检查,
+    # 否则 DROP TABLE 会把子表数据一起级联删掉。
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.executescript(f"""
+            CREATE TABLE archives_new (
+                id            INTEGER PRIMARY KEY,
+                name          TEXT NOT NULL UNIQUE,
+                size          INTEGER,
+                mtime         INTEGER,
+                entry_count   INTEGER,
+                image_count   INTEGER,
+                comicinfo_xml TEXT,
+                info_json     TEXT,
+                meta_json     TEXT,
+                metadata_json TEXT,
+                extra_json    TEXT,
+                has_meta      INTEGER DEFAULT 0,
+                scanned_at    TEXT,
+                error         TEXT
+            );
+            INSERT INTO archives_new ({old_cols})
+                SELECT {old_cols} FROM archives;
+            DROP TABLE archives;
+            ALTER TABLE archives_new RENAME TO archives;
+            CREATE INDEX IF NOT EXISTS idx_archives_has_meta
+                ON archives(has_meta);
+        """)
+        conn.commit()
+        return True
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
 
 
 def _upsert(conn, table, key_col, rec):
@@ -693,15 +735,26 @@ def _collect_targets(dirs, workers, stop_flag, recursive=True):
         return targets, unsupported
 
     if not recursive:
-        # 只要一层: 完全没有"下一层"要展开, 并行仍是逐目录跑
+        # 只要一层: 并行逐目录跑。外接盘(FUSE)单次 listdir 可能几秒,
+        # 所以要逐批处理并检查 stop_flag —— 一次性 list(map(...)) 的话
+        # 点停止要等全部目录跑完才响应, 看着像按钮失灵。
         if workers <= 1:
-            results = [_scan_one_dir(d) for d in roots]
-        else:
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                results = list(ex.map(_scan_one_dir, roots))
-        for subs, zips, unsup in results:
-            targets.extend(zips)
-            unsupported.extend(unsup)
+            for d in roots:
+                if stop_flag is not None and stop_flag():
+                    return targets, unsupported
+                subs, zips, unsup = _scan_one_dir(d)
+                targets.extend(zips)
+                unsupported.extend(unsup)
+            return targets, unsupported
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            CHUNK = workers          # 一批约等于一轮并发, 粒度够细
+            for i in range(0, len(roots), CHUNK):
+                if stop_flag is not None and stop_flag():
+                    return targets, unsupported
+                for subs, zips, unsup in ex.map(_scan_one_dir,
+                                                roots[i:i + CHUNK]):
+                    targets.extend(zips)
+                    unsupported.extend(unsup)
         return targets, unsupported
 
     def harvest(results):
@@ -824,7 +877,17 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
                     "name": name,
                     "scanned_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "error": err,
+                    "has_meta": 0,
                 })
+                # 解析失败的记录不能留着上一次的元数据: 文件损坏/被换成
+                # 别的东西后, 旧的 title/artist 还在, 浏览、统计、详情都
+                # 照旧显示它是个有效作品, 统计还会把它计入"有元数据"。
+                row = conn.execute("SELECT id FROM archives WHERE name=?",
+                                   (name,)).fetchone()
+                if row:
+                    conn.execute("DELETE FROM meta WHERE archive_id=?", (row[0],))
+                    conn.execute("DELETE FROM meta_values WHERE archive_id=?",
+                                 (row[0],))
                 emit(f"  ✗ {name[:70]}: {err}")
             else:
                 save(conn, rec)
@@ -969,6 +1032,21 @@ VALID_JOINS = ("and", "or")
 COUNT_OPS = ("count_eq", "count_gte", "count_lte")
 
 
+def is_blank_condition(cond):
+    """这个条件是不是"没填完"(需要值却给了空)。
+
+    空值条件必须被**所有**筛选路径忽略: 当成 `artist = ''` 会把结果滤成
+    0 条, 界面上看着像"没有匹配", 其实只是条件行没填。
+    build_where(SQL 路径) 和 _narrow_one(值级收窄路径) 共用这个判断 ——
+    只改一处的话, 浏览页正常而分类页仍然 0 条, 更难查。
+    """
+    op = (cond.get("op") or "eq").strip()
+    if op in ("empty", "not_empty") or op in COUNT_OPS:
+        return False                    # 这两个操作符本来就不需要值
+    v = cond.get("value")
+    return v is None or str(v).strip() == ""
+
+
 def _to_int(v, what="阈值"):
     try:
         return int(str(v).strip())
@@ -1034,12 +1112,9 @@ def build_where(conditions, join="and"):
             raise ValueError(f"非法字段: {field}")
         if op not in VALID_OPS:
             raise ValueError(f"非法操作符: {op}")
-        # 需要值的操作符遇到空值 -> 当作没填, 整条忽略。
-        # 否则会变成 `artist = ''`, 把结果滤成 0 条 —— 界面上一片空白,
-        # 看着像"没有匹配", 其实只是条件行没填完。
-        if op not in ("empty", "not_empty"):
-            if value is None or str(value).strip() == "":
-                continue
+        # 没填完的条件整条忽略(与 _narrow_one 共用同一判断)
+        if is_blank_condition(c):
+            continue
         if op == "empty":
             parts.append(
                 "NOT EXISTS (SELECT 1 FROM meta_values mv "
@@ -1157,6 +1232,11 @@ def _narrow_one(db_path, cond):
         raise ValueError(f"非法字段: {field}")
     if op not in VALID_OPS:
         raise ValueError(f"非法操作符: {op}")
+    # 没填完的条件 -> 不收窄(等价于没这个条件)。
+    # 不判的话 eq 会走到 {value} = {''}, 而库里没有空值作者 ->
+    # 得到空集合 -> 所有作品都被跳过, 分类页报"没有可分类的"。
+    if is_blank_condition(cond):
+        return None
     # 为空/不为空是作品级的: 一个作品在某字段上要么有值要么没有
     if op in ("empty", "not_empty"):
         return None
@@ -1210,6 +1290,50 @@ def narrow_values(db_path, conditions, join="and"):
             for s in sets:
                 acc |= s
         out[field] = acc
+    return out
+
+
+def no_value_names(db_path, conditions=None, join="and", field=None,
+                   names=None):
+    """在范围内、条件命中、但在 field 上**没有任何值**的作品名。
+
+    这些作品按该字段分组时该落到「未分类」。比如 parody 只有 original 的
+    作品: original 已被当作空, 于是它没有 parody 值 —— 但它仍然是个作品,
+    该进「未分类」, 而不是整条被丢掉(那样它永远不会被分类/移动)。
+    """
+    conditions = list(conditions or [])
+    narrow = narrow_values(db_path, conditions, join)
+    work_level = [c for c in conditions
+                  if (c.get("op") or "eq") in ("empty", "not_empty")]
+    where, args = build_where(work_level, join) if work_level else ("1=1", [])
+
+    conn = sqlite3.connect(db_path)
+    try:
+        scope = scope_clause(conn, names)
+        sql = ("SELECT a.name, a.id FROM archives a "
+               f"WHERE ({where}) AND ({scope})")
+        rows = conn.execute(sql, args).fetchall()
+        if not rows:
+            return []
+        # 这些作品在任意被收窄字段上是否还有值(没有 -> 被条件排除)
+        mv = {}
+        q = ("SELECT mv.archive_id, mv.field, mv.value FROM meta_values mv "
+             "JOIN archives a ON a.id=mv.archive_id "
+             f"WHERE {scope}")
+        for aid, f, v in conn.execute(q):
+            mv.setdefault(aid, {}).setdefault(f, []).append(v)
+    finally:
+        conn.close()
+
+    out = []
+    for name, aid in rows:
+        have = mv.get(aid, {})
+        # 收窄字段上一个值都不剩 -> 这个作品被条件排除了
+        if any(not any(v in allowed for v in have.get(f, []))
+               for f, allowed in narrow.items()):
+            continue
+        if not have.get(field):
+            out.append(name)
     return out
 
 
@@ -1274,6 +1398,7 @@ def query_entries(db_path=DEFAULT_DB, conditions=None, join="and",
             all_by.setdefault(aid, {}).setdefault(f, []).append(v)
 
     out = []
+    works = 0
     for r in rows:
         d = dict(zip(cols, r))
         aid = d["id"]
@@ -1286,6 +1411,11 @@ def query_entries(db_path=DEFAULT_DB, conditions=None, join="and",
                 break
         if skip:
             continue
+        # limit 按**作品**计, 不按条目: 一个作品有多个值时会展开成多条,
+        # 按条目截断会把它从中间切断, 分类时就只搬走一部分值。
+        if works >= limit:
+            break
+        works += 1
         meta = {k: d.get(k) for k in META_COLUMNS}
         for f in (fields if fields else MULTI_FIELDS):
             # 被条件收窄过的字段用收窄后的集合
@@ -1298,10 +1428,8 @@ def query_entries(db_path=DEFAULT_DB, conditions=None, join="and",
                 out.append({"archive_id": aid, "name": d["name"],
                             "field": f, "value": v,
                             "meta": meta})
-        if len(out) >= limit:
-            break
     out.sort(key=lambda e: (e["name"], e["field"], e["value"]))
-    return out[:limit]
+    return out
 
 
 # ---------------------------------------------------------------- 分组目录
@@ -1347,12 +1475,17 @@ def distinct_values(db_path=DEFAULT_DB, field="artist", limit=500, names=None):
     conn = sqlite3.connect(db_path)
     try:
         scope = scope_clause(conn, names)
+        # 读 meta_values(拆分 + 过滤后的索引表), 不读 meta 表的原始列。
+        # 否则下拉框会把已被当作空的值列出来 —— 比如原作里的 original,
+        # 分类时它走「未分类」, 下拉框却还列着, 两处自相矛盾;
+        # 而且原始列是多值逗号串, 拿它做等值筛选也匹配不上。
         rows = conn.execute(
-            f"SELECT m.{field}, COUNT(*) FROM meta m "
-            f"JOIN archives a ON a.id = m.archive_id "
-            f"WHERE m.{field} IS NOT NULL AND m.{field} != '' "
+            "SELECT mv.value, COUNT(DISTINCT mv.archive_id) FROM meta_values mv "
+            "JOIN archives a ON a.id = mv.archive_id "
+            "WHERE mv.field = ? AND mv.value IS NOT NULL AND mv.value != '' "
             f"AND ({scope}) "
-            f"GROUP BY m.{field} ORDER BY 2 DESC LIMIT {int(limit)}").fetchall()
+            f"GROUP BY mv.value ORDER BY 2 DESC LIMIT {int(limit)}",
+            (field,)).fetchall()
         return rows
     finally:
         conn.close()

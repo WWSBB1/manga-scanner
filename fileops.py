@@ -98,13 +98,16 @@ def _load_rows(db_path, names):
         return []
     conn = sqlite3.connect(db_path)
     try:
-        placeholders = ",".join("?" * len(names))
+        # 走临时表而不是 IN (?,?,...): 源目录可能有几万个文件, 拼成
+        # 参数列表会撞上 SQLite 的变量个数上限, 直接抛 OperationalError,
+        # 预览和分类整个失败。scanner.scope_clause 用的就是临时表。
+        scope = scanner.scope_clause(conn, names)
         cols = ["id", "name"] + scanner.META_COLUMNS
         sql = ("SELECT a.id, a.name, "
                + ",".join(f"m.{c}" for c in scanner.META_COLUMNS)
                + " FROM archives a LEFT JOIN meta m ON m.archive_id=a.id "
-                 f"WHERE a.name IN ({placeholders})")
-        rows = conn.execute(sql, names).fetchall()
+                 f"WHERE {scope}")
+        rows = conn.execute(sql).fetchall()
     finally:
         conn.close()
     return [dict(zip(cols, r)) for r in rows]
@@ -119,7 +122,8 @@ GROUP_DIR_CN = {
 
 
 def plan_transfer(db_path, names, base_dir, group_by="", mode="copy",
-                  entries=None, group_dir=False, paths=None):
+                  entries=None, group_dir=False, paths=None,
+                  fallback_names=None):
     """生成搬移计划(不碰文件),供预览和执行共用。
 
     多值字段会扇出: 一个作品在该字段有多个值就有多个目标目录。
@@ -132,9 +136,14 @@ def plan_transfer(db_path, names, base_dir, group_by="", mode="copy",
     paths:     {name: 绝对路径} —— 文件"当下在哪"。库不记路径, 所以搬移
                必须由调用方把本次找到的位置传进来(扫描结果或源目录扫描)。
                缺某个 name 就认为它这次找不到, exists_src=False。
+    fallback_names: 这些作品在该字段上没有任何值(如原作只有 original 的
+               原创作品), 应当落到「未分类」而不是被丢掉。与
+               entries 里值为 [] 的含义不同 —— 后者是"筛选后没保留值,
+               不该处理", 这里则是"本想按该字段归档, 但它没值"。
     返回 [{name, src, targets:[目录...], dest_dir, dest, exists_src, error}]
     dest_dir / dest 是第一个目标; targets 为空时两者都是 None。
     """
+    fallback = set(fallback_names or ())
     paths = paths or {}
     rows = _load_rows(db_path, names)
     by_name = {r["name"]: r for r in rows}
@@ -154,8 +163,14 @@ def plan_transfer(db_path, names, base_dir, group_by="", mode="copy",
                 # 传字段名, 让该字段的"等于没填"取值(如 parody 的 original)
                 # 也在这里生效
                 vals = scanner.split_values(r.get(group_by), group_by)
-            # 筛选结果([] 也是有效结果)不套用"未分类"兜底; 旧行为才兜底
-            vals = vals[:limit] or ([] if entries is not None else ["未分类"])
+            # 兜底成「未分类」的两种情况:
+            #   a) 旧行为(没给 entries): 从 meta 读不出值就未分类
+            #   b) fallback_names: 这个作品在该字段上本来就没值
+            # 其余"筛选后值为空"是有效结果 -> 不产生目标(不该处理它)
+            if not vals:
+                if entries is None or n in fallback:
+                    vals = ["未分类"]
+            vals = vals[:limit]
             # 包一层字段名目录(如 作者/、标签/)
             root = base_dir
             if group_dir:
@@ -232,7 +247,7 @@ def match_in_db(db_path, src_dir, recursive=True):
 
 def transfer_by_names(db_path, names, dest_dir, mode="copy", log=print,
                       progress=None, stop_flag=None, group_by="", entries=None,
-                      group_dir=False, paths=None):
+                      group_dir=False, paths=None, fallback_names=None):
     """按文件名列表批量移动/复制。
 
     names:    archives.name 的列表
@@ -246,7 +261,7 @@ def transfer_by_names(db_path, names, dest_dir, mode="copy", log=print,
     if mode not in ("copy", "move"):
         raise ValueError(f"mode 必须是 copy/move: {mode}")
     plan = plan_transfer(db_path, names, dest_dir, group_by, mode, entries,
-                         group_dir, paths)
+                         group_dir, paths, fallback_names)
     plan_by_name = {p["name"]: p for p in plan}
 
     ok = fail = skip = 0

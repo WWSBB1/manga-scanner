@@ -88,9 +88,12 @@ class API:
                     stop_flag=lambda: w["stop"], recursive=recursive)
                 w["stats"] = stats
                 # 记下这次扫到的文件名(连"没扫完就停"的那部分也算),
-                # 浏览页默认只看这批
+                # 浏览页默认只看这批。一起记下是哪个库 —— 扫描页可以填
+                # 别的库, 而浏览页永远读 DB_PATH, 不比对的话会用 A 库的
+                # 文件名去过滤 B 库, 结果一片空白。
                 if "names" in stats:
                     LAST_SCAN["names"] = stats["names"]
+                    LAST_SCAN["db"] = os.path.abspath(db)
                     LAST_SCAN["dirs"] = list(dirs)
                     LAST_SCAN["at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             except Exception as ex:
@@ -122,13 +125,20 @@ class API:
     def scope_names(scope="scan"):
         """浏览页该看哪些文件: None=全库, 列表=本次扫描到的那些。
 
-        scope="scan"(默认) 只看本次扫描扫到的; "all" 看全库。
-        还没扫过时 LAST_SCAN["names"] 是 None —— 这时不假装有范围,
-        否则浏览页会永远空着, 点"全部库"又是另一个极端。
+        scope="all" 看全库。"scan"(默认) 只看本次扫描扫到的 ——
+        还没扫过时返回**空列表**, 即"什么都没有"。绝不能返回 None:
+        那等于不设范围, 会把整个库倒出来, 跟"只看本次扫描"正好相反
+        (重启后 LAST_SCAN 就没了, 一进浏览页就会踩到)。
+
+        若上次扫描用的不是当前库(扫描页可以填别的库), 也当作"没扫过":
+        拿别的库的文件名过滤当前库只会得到空结果, 那比退回全库更误导。
         """
         if scope == "all":
             return None
-        return LAST_SCAN["names"]
+        if LAST_SCAN.get("db") and \
+                LAST_SCAN["db"] != os.path.abspath(DB_PATH):
+            return []
+        return LAST_SCAN["names"] or []
 
     @staticmethod
     def distinct(field, scope="scan"):
@@ -141,22 +151,37 @@ class API:
 
     @staticmethod
     def query(field, value, contains, limit=2000, scope="scan"):
+        # 用 meta_values 的 EXISTS 而不是 meta 的原始列:
+        # 原始列是多值逗号串, 等值匹配不上(整串不等于单值);
+        # 而且它没经过"视为空"的过滤, 会查出分类时根本不会出现的值
+        # (如原作里的 original)。
         where, args = "1=1", []
         if contains and field:
-            where, args = f"m.{field} LIKE ?", [f"%{contains}%"]
+            where = ("EXISTS (SELECT 1 FROM meta_values mv WHERE "
+                     "mv.archive_id=a.id AND mv.field=? AND mv.value LIKE ?)")
+            args = [field, f"%{contains}%"]
         elif value and field:
-            where, args = f"m.{field} = ?", [value]
+            where = ("EXISTS (SELECT 1 FROM meta_values mv WHERE "
+                     "mv.archive_id=a.id AND mv.field=? AND mv.value=?)")
+            args = [field, value]
         try:
             names = API.scope_names(scope)
             cols, rows = scanner.list_archives(DB_PATH, where, args, limit,
                                                names=names)
-            # 多值字段的条目数, 供前端显示 [N] 徽标
+            # 多值字段的条目数, 供前端显示 [N] 徽标。
+            # 只统计这一页涉及的作品, 不整表扫 —— meta_values 有 120 多万行,
+            # 每次查询都全表 GROUP BY 会白白多花几百毫秒。
+            page_ids = [dict(zip(cols, r)).get("id") for r in rows]
             conn = sqlite3.connect(DB_PATH)
             try:
                 cnt = {}
-                for aid, f, n in conn.execute(
-                        "SELECT archive_id, field, COUNT(*) FROM meta_values "
-                        "GROUP BY archive_id, field"):
+                if page_ids:
+                    ph = ",".join("?" * len(page_ids))
+                    for aid, f, n in conn.execute(
+                            "SELECT archive_id, field, COUNT(*) FROM meta_values "
+                            f"WHERE archive_id IN ({ph}) "
+                            "GROUP BY archive_id, field", page_ids):
+                        cnt.setdefault(aid, {})[f] = n
                     cnt.setdefault(aid, {})[f] = n
                 name_to_id = dict(conn.execute("SELECT name, id FROM archives"))
             finally:
@@ -219,8 +244,12 @@ class API:
             # 界面就报"没有可分类的"。
             paths = {i["name"]: i["src"] for i in
                      fileops.match_in_db(DB_PATH, src_dir, recursive)}
+            # limit 按作品计。范围已经收窄到源目录, 所以上限就取源目录里
+            # 的文件数 —— 用默认 5000 的话, 源目录超过 5000 个文件时会
+            # 静默漏掉一部分, 用户还以为都处理了。
             entries = scanner.query_entries(DB_PATH, conditions, join,
-                                            fields=[group_by], limit=limit,
+                                            fields=[group_by],
+                                            limit=max(limit, len(paths) or 1),
                                             names=list(paths))
             # 按作品聚合成 {name: [值...]}
             by_name = {}
@@ -228,12 +257,23 @@ class API:
                 by_name.setdefault(e["name"], [])
                 if e["value"] not in by_name[e["name"]]:
                     by_name[e["name"]].append(e["value"])
+            # 在该字段上没有任何值的作品(如原作只有 original 的原创作品):
+            # 记成空列表, 让它们落到「未分类」。
+            # 不补进来的话它们根本没有条目, 会整条被丢掉 —— 永远分类不到。
+            fallback = []
+            if group_by:
+                fallback = scanner.no_value_names(
+                    DB_PATH, conditions, join, field=group_by,
+                    names=list(paths))
+                for n in fallback:
+                    by_name.setdefault(n, [])
             names = list(by_name)
             # paths 只包含源目录里真实存在的文件; 源目录没填时为空 ->
             # exists_src 全 False, 预览会提示"找不到", 这是诚实的
             plan = fileops.plan_transfer(DB_PATH, names, base_dir, group_by,
                                          entries=by_name, group_dir=group_dir,
-                                         paths=paths)
+                                         paths=paths,
+                                         fallback_names=fallback)
             # 预览按条目展开: 一个作品多个值就是多行
             rows = []
             for p in plan:
@@ -266,30 +306,44 @@ class API:
 
         def worker():
             try:
-                paths = {}
-                if src_dir:
-                    paths = {i["name"]: i["src"] for i in
-                             fileops.match_in_db(DB_PATH, src_dir, recursive)}
-                # 同样在 SQL 层按源目录收窄, 免得被 limit 截断
+                # 源目录必填: 库不记路径, 没有它就不知道文件在哪。
+                # 移动不可逆, 不能让它带着空名单一路跑成"全部失败"。
+                if not src_dir:
+                    w["result"] = {"error": "请先填源目录 —— 库不记文件路径,"
+                                            "要知道文件在哪才能搬"}
+                    return
+                if not os.path.isdir(src_dir):
+                    w["result"] = {"error": f"源目录不存在: {src_dir}"}
+                    return
+                paths = {i["name"]: i["src"] for i in
+                         fileops.match_in_db(DB_PATH, src_dir, recursive)}
+                # 同样在 SQL 层按源目录收窄; limit 取源目录文件数,
+                # 免得超过默认上限时静默漏掉一部分文件
                 entries = scanner.query_entries(
                     DB_PATH, conditions or [], join, fields=[group_by],
-                    names=(list(paths) if src_dir else None))
+                    limit=max(len(paths), 1), names=list(paths))
                 by_name = {}
                 for e in entries:
                     by_name.setdefault(e["name"], [])
                     if e["value"] not in by_name[e["name"]]:
                         by_name[e["name"]].append(e["value"])
+                # 该字段没值的作品归「未分类」, 不能整条丢掉
+                fallback = []
+                if group_by:
+                    fallback = scanner.no_value_names(
+                        DB_PATH, conditions or [], join, field=group_by,
+                        names=list(paths))
+                    for n in fallback:
+                        by_name.setdefault(n, [])
                 use_names = list(by_name)
                 if not use_names:
                     log_fn("筛选后没有任何条目, 无事可做")
-                elif not paths:
-                    # 源目录没填 -> 不知道该去哪找文件, 下面每个都会报"源文件不存在"
-                    log_fn("⚠ 没填源目录, 无法定位文件 —— 库不记路径")
                 result, errs = fileops.transfer_by_names(
                     DB_PATH, use_names, dest, mode,
                     log=log_fn, progress=progress,
                     stop_flag=lambda: w["stop"], group_by=group_by,
-                    entries=by_name, group_dir=group_dir, paths=paths)
+                    entries=by_name, group_dir=group_dir, paths=paths,
+                    fallback_names=fallback)
                 w["result"] = result
                 w["errors"] = errs
             except Exception as ex:
