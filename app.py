@@ -1237,7 +1237,8 @@ const RD_FIELDS={tags:'标签',artist:'作者',group_name:'社团',parody:'原�
   character:'角色',category:'分类',language:'语言',title:'标题'};
 let rdFavs=JSON.parse(localStorage.getItem('manga_rd_favs')||'[]');
 let rdSel=[], rdItems=[], rdView=null, rdPageIdx=0, rdQuickTimer=null, rdHistoryPushed=false, rdDelTimer=null, rdManageFavs=false;
-let rdExpanded=new Set();
+let rdExpanded=new Set(), rdListPage=0, rdDirTotal=0;
+const RD_PAGE_SIZE=30;
 function rdViewMode(){const v=localStorage.getItem('manga_rd_view')||'grid';
   return document.getElementById('rd-view')&&v!=='grid'?v:'grid'}
 function rdChangeView(){const v=document.getElementById('rd-view').value;
@@ -1268,7 +1269,10 @@ function rdRenderGroups(){const grid=document.getElementById('rd-grid');
   grid.classList.remove('rd-grid');grid.style.gridTemplateColumns='';
   grid.classList.add('rd-group-list');
   const groups=rdGroups();
-  grid.innerHTML=groups.map((g,i)=>{
+  const start=rdListPage*RD_PAGE_SIZE;
+  const pageGroups=groups.slice(start,start+RD_PAGE_SIZE);
+  grid.innerHTML=pageGroups.map((g,i)=>{
+    const gi=start+i;
     const exp=rdExpanded.has(g.label);
     const cards=g.items.slice(0,10).map(it=>{
       const idx=rdItems.indexOf(it);
@@ -1284,11 +1288,11 @@ function rdRenderGroups(){const grid=document.getElementById('rd-grid');
     }).join('')+'</div>':'';
     return '<div class="rd-grow"><div class="rd-glabel" title="'+esc(g.label)+'">'+esc(g.label)+'('+g.items.length+')</div>'+
       '<div class="rd-gstrip">'+cards+'</div>'+
-      '<button class="rd-gmore" onclick="rdToggleGroup('+i+')">'+(exp?'收起':'展开')+'</button></div>'+rest;
+      '<button class="rd-gmore" onclick="rdToggleGroup('+gi+')">'+(exp?'收起':'展开')+'</button></div>'+rest;
   }).join('')||'<div class="rd-loading">没有符合条件的漫画</div>';
   rdFillThumbs(grid);
-  document.getElementById('rd-more').textContent=rdItems.length>=60?
-    '只显示前 60 本, 缩小筛选范围可看到更多':''}
+  rdPager(Math.ceil(groups.length/RD_PAGE_SIZE),
+    '共 '+groups.length+' 组 / '+rdItems.length+' 本');}
 function rdToggleGroup(i){const label=rdGroups()[i].label;
   if(rdExpanded.has(label))rdExpanded.delete(label);else rdExpanded.add(label);
   rdRenderGroups()}
@@ -1412,12 +1416,12 @@ function rdConditions(){
   return out;
 }
 function rdLoad(){
-  rdOffset=0; rdExpanded.clear();
+  rdListPage=0; rdExpanded.clear();
   const v=rdViewMode(); const sel=document.getElementById('rd-view');
   if(sel)sel.value=v;
   const body={src_dir:rdDir(),conditions:rdConditions(),
     join:document.getElementById('rd-join').value,
-    scope:'all',limit:60};
+    scope:'all',limit:100000};
   fetch('/api/reader/list',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(body)}).then(r=>r.json()).then(d=>{
       if(d.error||!Array.isArray(d.items)){
@@ -1425,7 +1429,7 @@ function rdLoad(){
           '<div class="rd-loading">'+esc(d.error||'接口返回格式错误')+'</div>';
         return;
       }
-      rdItems=d.items;
+      rdItems=d.items; rdDirTotal=d.in_dir||0;
       document.getElementById('rd-count').textContent=
         d.items.length+' / 共 '+d.total+' 本 (目录里 '+d.in_dir+' 本)';
       rdRenderView();
@@ -1435,19 +1439,29 @@ function rdApplyCols(){
   const n=parseInt(document.getElementById('rd-cols').value)||2;
   document.getElementById('rd-grid').style.gridTemplateColumns='repeat('+n+',1fr)';
 }
+function rdPager(totalPages,countDesc){
+  document.getElementById('rd-more').innerHTML=totalPages<=1?countDesc:
+    '<button class="outline" onclick="rdTurn(-1)"'+(rdListPage<=0?' disabled':'')+'>上页</button> '+
+    '<span style="font-size:12px;color:#666;margin:0 8px">'+(rdListPage+1)+' / '+totalPages+' ('+countDesc+')</span> '+
+    '<button class="outline" onclick="rdTurn(1)"'+(rdListPage>=totalPages-1?' disabled':'')+'>下页</button>'}
+function rdTurn(d){rdListPage+=d;rdExpanded.clear();rdRenderView();
+  window.scrollTo({top:document.getElementById('rd-grid').offsetTop,behavior:'instant'})}
 function rdRenderGrid(){
   rdApplyCols();
   const grid=document.getElementById('rd-grid');
-  grid.innerHTML=rdItems.map((it,i)=>{
+  const start=rdListPage*RD_PAGE_SIZE;
+  const pageItems=rdItems.slice(start,start+RD_PAGE_SIZE);
+  grid.innerHTML=pageItems.map((it,i)=>{
+    const idx=start+i;
     const sub=it.artist||it.parody||'';
-    return '<div class="rd-card" onclick="rdOpen('+i+')">'+
+    return '<div class="rd-card" onclick="rdOpen('+idx+')">'+
       '<img class="rd-thumb" loading="lazy" alt="" data-name="'+esc(it.name)+'" data-size="'+it.size+'">' +
       '<div class="rd-meta"><div class="rd-name">'+esc(it.title||it.name)+'</div>'+
       '<div class="rd-sub">'+esc(sub)+'</div></div></div>';
   }).join('')||'<div class="rd-loading">没有符合条件的漫画</div>';
   rdFillThumbs(grid);
-  document.getElementById('rd-more').textContent=rdItems.length>=60?
-    '只显示前 60 本, 缩小筛选范围可看到更多':'';
+  rdPager(Math.ceil(rdItems.length/RD_PAGE_SIZE),
+    '共 '+rdItems.length+' 本 (目录里 '+rdDirTotal+' 本)');
 }
 function rdOpen(i){
   rdView=rdItems[i];
