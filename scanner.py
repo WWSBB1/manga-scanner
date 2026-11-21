@@ -11,8 +11,8 @@
     metadata.json   其它下载器,标签列表在顶层
 
 增量规则:
-    - 上次成功且有归一化元数据,且文件 size+mtime 未变 -> 跳过
-    - 读过但没解析出元数据 -> 下次重读(下载器可能后补)
+    - 上次成功且文件 name+size 未变 -> 跳过(不比 mtime)
+    - 读过但没解析出元数据 -> size 不变也跳过(重读结果必然一样)
     - 上次报错 -> 下次重试
     - 同名不同目录 -> 告警跳过,不覆盖
 
@@ -29,6 +29,10 @@ import time
 import xml.etree.ElementTree as ET
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+
+# 数据源层: 本地磁盘与 rclone 远程共用一套接口。source.py 不反向依赖
+# 本模块, 所以不是循环导入。
+import source as _source
 
 # ---------------------------------------------------------------- 配置
 
@@ -385,12 +389,23 @@ def classify_entries(names):
 
 # ---------------------------------------------------------------- 扫描单个压缩包
 
-def scan_one(path):
-    """扫一个压缩包,返回记录 dict。异常由调用方捕获。"""
-    size = os.path.getsize(path)
+def scan_one(path, size=None, mtime=None, fileobj=None):
+    """扫一个压缩包,返回记录 dict。异常由调用方捕获。
+
+    path     只用来取文件名(远程时是一个 `123:/a/b.zip` 形式的字符串)。
+    size/mtime 给定时直接用 —— 远程文件不落地, 大小和 mtime 只能来自
+              rclone 的目录清单; 不给则按本地文件读(老调用行为不变)。
+    fileobj  可 seek 的只读文件对象。远程用 RemoteFile, 本地不传。
+    """
+    if size is None:
+        size = os.path.getsize(path)
     if not size:
         raise RuntimeError("文件大小为 0")
-    with zipfile.ZipFile(path) as zf:
+    if fileobj is None:
+        zf_ctx = zipfile.ZipFile(path)
+    else:
+        zf_ctx = zipfile.ZipFile(fileobj)
+    with zf_ctx as zf:
         names = zf.namelist()
         found, extra_names, images = classify_entries(names)
         texts = {}
@@ -408,10 +423,13 @@ def scan_one(path):
     has_meta = any(meta.get(k) for k in
                    ("title", "artist", "tags", "language", "parody"))
 
+    if mtime is None:
+        mtime = int(os.path.getmtime(path))
+
     rec = {
         "name": os.path.basename(path),
         "size": size,
-        "mtime": int(os.path.getmtime(path)),
+        "mtime": mtime,
         "entry_count": len(names),
         "image_count": images,
         "extra_json": json.dumps(extra, ensure_ascii=False) if extra else None,
@@ -793,7 +811,9 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
     """扫描目录列表,增量入库。返回统计 dict。
 
     log:        每行日志的回调(GUI 里接 UI)
-    progress:   (done, total) 回调
+    progress:   (done, total, current, phase) 回调。current 是正在处理的
+                文件名, phase 是当前阶段文字。远程扫描每个文件要一两秒,
+                界面靠它显示"已处理 N/M"的一行进度, 而不是刷一屏日志。
     stop_flag:  可变对象,真值即中止(GUI 停止按钮)
     recursive:  False 时只扫给定目录这一层, 不下潜子目录。
                 默认 True —— CLI 与老调用行为不变; 界面按需传 False。
@@ -801,19 +821,66 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
     def emit(msg):
         log(msg)
 
-    for root in dirs:
+    # ---- 按数据源分派 -------------------------------------------------
+    # 远程和本地都当成"数据源"看, 但**不能混在同一批里扫**:
+    # archives.name 是唯一键, 两边出现同名文件时会互相覆盖元数据,
+    # 而本次记录的位置(found_paths)只会指向其中一个存储 ——
+    # 正是之前修过的"元数据与实搬文件不是同一份"。
+    remote_roots = [d for d in dirs if _source.is_remote(d)]
+    local_roots = [d for d in dirs if not _source.is_remote(d)]
+    if remote_roots and local_roots:
+        raise ValueError("本地目录与远程路径不能混在同一次扫描里, 请分两次扫")
+    for root in local_roots:
         if not os.path.isdir(root):
             emit(f"⚠ 目录不存在: {root}")
 
     t_walk = time.time()
-    w_walk = walk_workers(dirs)
-    if w_walk > 1:
-        emit(f"遍历目录: {w_walk} 线程")
-    targets, unsupported = _collect_targets(dirs, w_walk, stop_flag, recursive)
-    emit(f"发现 {len(targets)} 个可解析压缩包"
+    unsupported = []
+    # 统一成 {path, name, size, mtime, src, rel}: 本地 size/mtime 为
+    # None 表示"当场读", 远程则由目录清单带来(远程文件不落地)。
+    items = []
+    if remote_roots:
+        for root in remote_roots:
+            emit(f"正在拉取远程文件清单: {root} (大目录可能需要几十秒)…")
+            if progress:
+                progress(0, 0, "", "拉取远程文件清单")
+            # 扫描必须拿最新清单: get_source 是进程级单例, 缓存可能还是
+            # 上一次扫描时的。不失效的话"再扫一遍"看不到新增文件,
+            # 已删的还当成存在。
+            _source.drop_source(root)
+            src = _source.get_source(root)
+            try:
+                entries = src.list_archives(recursive=recursive)
+            except _source.SourceError as e:
+                emit(f"⚠ {root}: 读取失败 — {e}")
+                continue
+            emit(f"  {root}: {len(entries)} 个")
+            for rel, name, size, mtime in entries:
+                items.append({"path": _source.join(root, rel), "name": name,
+                              "size": size, "mtime": mtime,
+                              "src": src, "rel": rel})
+            try:
+                unsupported.extend(src.list_notice(recursive=recursive))
+            except _source.SourceError:
+                pass
+        w_walk = _source.REMOTE_WORKERS
+        emit(f"远程解析: {w_walk} 线程")
+    else:
+        w_walk = walk_workers(dirs)
+        if w_walk > 1:
+            emit(f"遍历目录: {w_walk} 线程")
+        targets, unsupported = _collect_targets(dirs, w_walk, stop_flag,
+                                                recursive)
+        for path in targets:
+            items.append({"path": path, "name": os.path.basename(path),
+                          "size": None, "mtime": None, "src": None,
+                          "rel": None})
+    emit(f"发现 {len(items)} 个可解析压缩包"
          + (f",另 {len(unsupported)} 个 rar/7z 不解析" if unsupported else "")
          + (" (不含子目录)" if not recursive else "")
          + f" (遍历耗时 {time.time() - t_walk:.1f}s)")
+    if progress:
+        progress(0, 0, "", "检查增量")
 
     conn = open_db(db_path)
     try:
@@ -822,8 +889,8 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
         # 本次扫到的位置: {name: 绝对路径}。路径只是"当下在哪"的临时记忆,
         # 供本次搬移使用; 不入库(文件挪个位置库里的路径就过期了)。
         found_paths = {}
-        for path in targets:
-            name = os.path.basename(path)
+        for it in items:
+            path, name = it["path"], it["name"]
             # 同名多次出现(同名文件散在多个目录): 取**最后**扫到的那个。
             # 必须与入库口径一致 —— 库里以 name 为唯一键, 后写的记录覆盖
             # 先写的, 所以库里的元数据来自最后一个。这里若取第一个,
@@ -832,48 +899,91 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
             found_paths[name] = path
             prev = existing.get(name)
             if prev is not None:
-                prev_size, prev_mtime, prev_meta, prev_err = prev
-                try:
-                    st_size, st_mtime = os.path.getsize(path), int(os.path.getmtime(path))
-                except OSError:
-                    continue
-                # 只比内容(size/mtime), 不比路径: 文件换了位置但内容没变
-                # 依然算"没变", 不该重解析, 更不该整条跳过。
-                #
-                # 也不看 has_meta: 元数据是存在 zip 里的, 事后补进去必然
-                # 改变 size/mtime, 靠内容比对就能发现。内容没变还重读,
-                # 结果必然和上次一样, 纯属白读(曾有 45 个文件每次全量重读)。
-                if (prev_err is None
-                        and prev_size == st_size and prev_mtime == st_mtime):
+                prev_size, _prev_mtime, prev_meta, prev_err = prev
+                if it["size"] is not None:
+                    st_size = it["size"]
+                else:
+                    try:
+                        st_size = os.path.getsize(path)
+                    except OSError:
+                        continue
+                # 只按 name+size 判断, 不比路径, 也不比 mtime。
+                # 本地 mtime 是文件落在本机的时间, 远程 mtime 是云端
+                # ModTime: 同一个文件上传后两边几乎必然不同, 拿它当判据
+                # 会让"本地扫过 -> 上传 -> 扫云端"整批重新解析。
+                # mtime 仍照常入库, 只是不参与增量判断; 内容真被改写
+                # 时若大小没变, 用界面上的「强制重扫」补一次即可。
+                if prev_err is None and prev_size == st_size:
                     skip_n += 1
                     if not prev_meta:
                         skipped_nometa += 1
                     continue
-            todo.append(path)
+            todo.append(it)
         emit(f"待处理 {len(todo)},增量跳过 {skip_n}"
-             + (f"(其中 {skipped_nometa} 个解析不出元数据, 内容没变不再重读)"
+             + (f"(其中 {skipped_nometa} 个解析不出元数据, 大小没变不再重读)"
                 if skipped_nometa else ""))
 
         done = fail = nometa = 0
         failures = []
         t0 = time.time()
-        n_workers = workers if workers is not None else worker_count(dirs)
+        if remote_roots:
+            n_workers = _source.REMOTE_WORKERS
+        else:
+            n_workers = workers if workers is not None else worker_count(dirs)
         if n_workers > 1:
             emit(f"并行扫描: {n_workers} 线程")
 
         # 并行只做"读+解析"(纯函数,无共享状态); 写库仍在主线程串行
         # (SQLite 连接不能跨线程)。
-        def parse(path):
+        def parse(it):
             try:
-                return path, scan_one(path), None
+                if it["src"] is not None:
+                    # 远程: 打开远端文件对象, 交给同一套 zip 解析逻辑
+                    with it["src"].open_file(it["rel"]) as fh:
+                        rec = scan_one(it["path"], size=it["size"],
+                                       mtime=it["mtime"], fileobj=fh)
+                else:
+                    rec = scan_one(it["path"], size=it["size"],
+                                   mtime=it["mtime"])
+                return it, rec, None
             except Exception as e:
-                return path, None, f"{type(e).__name__}: {e}"
+                err = f"{type(e).__name__}: {e}"
+                # 远程读到的空内容已经由 source 层重试过, 走到这里就是
+                # 服务端限流。别让它看起来像文件损坏 —— 两者处理方式
+                # 完全不同(等待重扫 vs 检查文件)。
+                if (it["src"] is not None
+                        and "返回空内容" in str(e)):
+                    err += " (多半是 123 网盘限流, 稍后重扫即可)"
+                return it, None, err
 
-        def consume(path, rec, err, i):
+        def consume(it, rec, err, i):
             """把一条解析结果写库。返回 True 表示已中止。"""
             nonlocal done, fail, nometa
-            name = os.path.basename(path)
-            if err is not None:
+            name = it["name"]
+            # 远程读取失败多是网络/限流, 不代表文件本身坏了。这种情况
+            # **不能删掉已有的元数据** —— 删了下次还得重读, 而这期间
+            # 浏览/统计里就凭空少了一个作品。只记下"这次没读成",
+            # 保留旧记录, 下次重扫再补。
+            transient = (it["src"] is not None and err is not None
+                         and ("不完整" in err or "返回空" in err
+                              or "超时" in err))
+            if err is not None and transient:
+                fail += 1
+                failures.append((name, err))
+                prev = conn.execute(
+                    "SELECT has_meta FROM archives WHERE name=?",
+                    (name,)).fetchone()
+                if prev is None:
+                    _upsert(conn, "archives", "name", {
+                        "name": name,
+                        "scanned_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "error": err, "has_meta": 0,
+                    })
+                # 远程逐个文件打日志会刷屏(930 个), 进度行已经在滚,
+                # 这里只在远程时静默记录, 结尾统一汇总。
+                if it["src"] is None:
+                    emit(f"  ✗ {name[:70]}: {err}")
+            elif err is not None:
                 fail += 1
                 failures.append((name, err))
                 _upsert(conn, "archives", "name", {
@@ -891,37 +1001,41 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
                     conn.execute("DELETE FROM meta WHERE archive_id=?", (row[0],))
                     conn.execute("DELETE FROM meta_values WHERE archive_id=?",
                                  (row[0],))
-                emit(f"  ✗ {name[:70]}: {err}")
+                if it["src"] is None:
+                    emit(f"  ✗ {name[:70]}: {err}")
             else:
                 save(conn, rec)
                 if not rec["has_meta"]:
                     # 解析成功(能读、没报错)但里面没有元数据文件。
                     # 内容不变就不会再重读 —— 重读结果必然一样。
                     nometa += 1
-                    emit(f"  ○ {name[:70]} (解析不出元数据,已入库)")
+                    # 远程不逐条打: 930 个里有一大批没元数据, 会把日志
+                    # 冲成瀑布。结尾的汇总里已经有这个数。
+                    if it["src"] is None:
+                        emit(f"  ○ {name[:70]} (解析不出元数据,已入库)")
                 done += 1
             if i % 10 == 0 or i == len(todo):
                 conn.commit()
             if progress:
-                progress(i, len(todo))
+                progress(i, len(todo), name, "解析元数据")
 
         if n_workers <= 1:
-            for i, path in enumerate(todo, 1):
+            for i, it in enumerate(todo, 1):
                 if stop_flag is not None and stop_flag():
                     emit("⏹ 用户中止")
                     break
-                consume(path, *parse(path)[1:], i)
+                consume(*parse(it), i)
         else:
             with ThreadPoolExecutor(max_workers=n_workers) as ex:
                 # map 按输入顺序产出结果, 入库顺序与单线程一致。
                 # 提前 break 会等已派发的任务收尾后才退出, 最长约
                 # (未完成数 / 线程数) 个文件的耗时。
                 it = ex.map(parse, todo)
-                for i, (path, rec, err) in enumerate(it, 1):
+                for i, (item, rec, err) in enumerate(it, 1):
                     if stop_flag is not None and stop_flag():
                         emit("⏹ 用户中止")
                         break
-                    consume(path, rec, err, i)
+                    consume(item, rec, err, i)
         conn.commit()
         el = time.time() - t0
         emit(f"完成: 成功 {done}"
@@ -929,7 +1043,16 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
              + f",失败 {fail},跳过 {skip_n},耗时 {el:.1f}s")
         if failures:
             emit(f"失败 {len(failures)} 个(下次自动重试)")
-        return {"total": len(targets), "todo": len(todo), "done": done,
+            # 远程失败不逐条打, 这里给出前几条和原因分布, 否则用户
+            # 只看到一个数字, 不知道是限流、文件坏了还是别的。
+            if remote_roots:
+                from collections import Counter
+                why = Counter(f"{n}: {e}" for n, e in failures)
+                for line, cnt in why.most_common(5):
+                    emit(f"  · {line}" + (f"  (共 {cnt} 个)" if cnt > 1 else ""))
+                if len(why) > 5:
+                    emit(f"  · …另有 {len(why) - 5} 种原因未列出")
+        return {"total": len(items), "todo": len(todo), "done": done,
                 "fail": fail, "skip": skip_n,
                 # 解析成功但里面没有元数据文件的个数(它们也在 done 里)
                 "nometa": nometa,
@@ -1044,10 +1167,16 @@ def is_blank_condition(cond):
     只改一处的话, 浏览页正常而分类页仍然 0 条, 更难查。
     """
     op = (cond.get("op") or "eq").strip()
-    if op in ("empty", "not_empty") or op in COUNT_OPS:
+    if op in ("empty", "not_empty"):
         return False                    # 这两个操作符本来就不需要值
     v = cond.get("value")
-    return v is None or str(v).strip() == ""
+    if v is None or str(v).strip() == "":
+        # 数量条件也要数字: 空着说明这行还没填完, 整条忽略。
+        # 以前对 count_* 直接返回 False(当成"填好了"), 于是空的数量条件
+        # 会被 _to_int("") 变成 0 —— `作者 >= 0` 等于没条件, 却让界面
+        # 看起来像"筛过了", 结果一动不动。
+        return True
+    return False
 
 
 def _to_int(v, what="阈值"):
@@ -1057,18 +1186,21 @@ def _to_int(v, what="阈值"):
         raise ValueError(f"非法{what}: {v!r}")
 
 
-def count_groups(db_path, field, min_count=0, max_count=0,
+def count_groups(db_path, field, min_count=None, max_count=None,
                  base_conditions=None, join="and", names=None):
     """按字段的拆分值分组计数,返回作品数达标的值列表。
 
     base_conditions: 先按这些条件圈定候选作品(数量条件与它们取交集)
-    min_count / max_count: 0 表示不限;两个都是 0 时至少要求 1 个作品
+    min_count / max_count: None 表示**不限**。
+        用 None 而不是 0 当"不限"的哨兵 —— 0 是一个合法阈值
+        (如 `作者 = 0`、`作者 <= 0`), 拿 0 当哨兵会让这两种条件
+        退化成"不限", 静默返回全部值(实测返回 4958 个)。
     names: 只看这批文件名(None=全库; 空列表=一条都不给)
     """
     if field not in VALID_FIELDS:
         raise ValueError(f"非法字段: {field}")
-    lo = _to_int(min_count, "下限") if min_count else 1
-    hi = _to_int(max_count, "上限") if max_count else 0
+    lo = _to_int(min_count, "下限") if min_count is not None else 0
+    hi = _to_int(max_count, "上限") if max_count is not None else None
     where, args = build_where(base_conditions or [], join)
     conn = sqlite3.connect(db_path)
     try:
@@ -1078,7 +1210,7 @@ def count_groups(db_path, field, min_count=0, max_count=0,
                f"WHERE mv.field=? AND ({where}) AND ({scope}) "
                "GROUP BY mv.value")
         params = [field] + list(args)
-        if hi:
+        if hi is not None:
             sql += " HAVING c >= ? AND c <= ?"
             params += [lo, hi]
         else:
@@ -1156,14 +1288,18 @@ def build_where(conditions, join="and"):
     return glue.join(parts), args
 
 
-def query_archives(db_path=DEFAULT_DB, conditions=None, join="and", limit=2000):
+def query_archives(db_path=DEFAULT_DB, conditions=None, join="and",
+                   limit=2000, names=None):
     """按多条件查询,返回 (cols, rows)。
 
     数量类条件(count_gte / count_lte)先分组计数算出达标的值,
     再把这些值当成等值条件并入查询。
 
-    计数范围是**全部作品**,不受普通条件限制——否则 `作者数量>=5 OR
-    语言=日语` 会先在日语作品里数作者,结果为空,整个 OR 就废了。
+    计数范围跟着 names 走 —— 库只是元数据缓存, "这个作者有几个作品"
+    该按**当前这批文件**数, 而不是按库里存了多少条历史记录。以前固定
+    按全库数(且没有 names 参数), 结果在一个只有 3 个该作者作品的源目录里
+    也会把 `作者>=5` 判成通过。
+
     普通条件照常通过 join 拼接参与,语义是"先各自算集合,再按 join 合并"。
     多个数量条件之间是交集(用户明确说这种情况该自己规避,不做拦截)。
     """
@@ -1172,24 +1308,27 @@ def query_archives(db_path=DEFAULT_DB, conditions=None, join="and", limit=2000):
     counts = [c for c in conditions if (c.get("op") or "eq") in COUNT_OPS]
     if not counts:
         where, args = build_where(normal, join)
-        return list_archives(db_path, where, args, limit)
+        return list_archives(db_path, where, args, limit, names=names)
 
-    # 每个数量条件: 在全部作品范围内分组计数
+    # 每个数量条件: 在当前范围内分组计数
     extras = []
     for c in counts:
-        v = _to_int(c.get("value") or 0)
+        if is_blank_condition(c):
+            continue                    # 没填数字的条件整条忽略
+        v = _to_int(c.get("value"))
         op = c.get("op")
         if op == "count_eq":
             lo = hi = v
         elif op == "count_gte":
-            lo, hi = v, 0
-        else:                       # count_lte
-            lo, hi = 0, v
-        vals = count_groups(db_path, c["field"], min_count=lo, max_count=hi)
+            lo, hi = v, None
+        else:                           # count_lte
+            lo, hi = None, v
+        vals = count_groups(db_path, c["field"], min_count=lo, max_count=hi,
+                            names=names)
         if not vals:
             # 这个数量条件没有任何达标值, 单独看它是空集
             if join == "and":
-                return list_archives(db_path, "1=0", [], limit)
+                return list_archives(db_path, "1=0", [], limit, names=names)
             extras.append((c["field"], []))
             continue
         extras.append((c["field"], vals))
@@ -1207,26 +1346,49 @@ def query_archives(db_path=DEFAULT_DB, conditions=None, join="and", limit=2000):
                      f"AND mv.value IN ({ph}))")
             args += [field] + vals
         where = f"({where}) {join.upper()} ({block})"
-    return list_archives(db_path, where, args, limit)
+    return list_archives(db_path, where, args, limit, names=names)
 
 
 # ---------------------------------------------------------------- 值级筛选
 
-def _all_values(db_path, field, limit=20000):
-    """某字段在库里出现过的全部值(用于否定条件求补集)。"""
+def _all_values(db_path, field, names=None, limit=20000):
+    """某字段**在当前范围内**出现过的全部值(用于否定条件求补集)。
+
+    names: 只看这批文件名(None=全库; 空列表=一条都不给)。
+           必须跟着范围走: 库只是元数据缓存, "有哪些值"是相对于
+           当前要处理的这批文件而言的。按全库取的话, ne/not_contains
+           的补集会掺进范围外的一堆值(实测 4957 个里 4919 个是范围外的)。
+
+    limit 只作异常数据的兜底。**绝不能靠它静默截断**: 补集被截掉的值
+    会被误判成"不满足条件"从而漏掉真正的作品。真到了上限就明确报错,
+    让人知道结果不完整, 而不是悄悄给个错的。
+    """
     conn = sqlite3.connect(db_path)
     try:
-        return {r[0] for r in conn.execute(
-            "SELECT DISTINCT value FROM meta_values WHERE field=? LIMIT ?",
-            (field, limit))}
+        scope = scope_clause(conn, names)
+        sql = ("SELECT DISTINCT mv.value FROM meta_values mv "
+               "JOIN archives a ON a.id=mv.archive_id "
+               f"WHERE mv.field=? AND ({scope})")
+        vals = {r[0] for r in conn.execute(sql, (field,))}
+        if len(vals) > limit:
+            raise ValueError(
+                f"字段 {field} 在当前范围内的不同值有 {len(vals)} 个, "
+                f"超过 {limit} 上限, '不等于/不包含'无法可靠求补集")
+        return vals
     finally:
         conn.close()
 
 
-def _narrow_one(db_path, cond):
+def _narrow_one(db_path, cond, names=None):
     """单个条件 -> (字段, 保留的值集合)。
 
     返回 None 表示这个条件是作品级的(为空/不为空), 不收窄值集合。
+
+    names: 当前范围(None=全库)。**必须一路传下去**: 数量条件要数的是
+           "这批文件里"的作品数, 不是库里存了多少条历史记录 ——
+           库只是元数据缓存。不传的话会把范围外的作品也数进去,
+           实测 `作者>=5` 在一个只有 3 个该作者作品的源目录里也会通过,
+           于是那 3 个文件被按 14 个作品的分量误判、各自散进作者目录。
     """
     field = (cond.get("field") or "").strip()
     op = (cond.get("op") or "eq").strip()
@@ -1244,16 +1406,15 @@ def _narrow_one(db_path, cond):
     if op in ("empty", "not_empty"):
         return None
     if op in COUNT_OPS:
-        v = _to_int(value or 0)
         if op == "count_eq":
-            lo = hi = v
+            lo = hi = _to_int(value or 0)
         elif op == "count_gte":
-            lo, hi = v, 0
-        else:
-            lo, hi = 0, v
+            lo, hi = _to_int(value or 0), None
+        else:                                   # count_lte
+            lo, hi = None, _to_int(value or 0)
         return field, set(count_groups(db_path, field, min_count=lo,
-                                       max_count=hi))
-    allv = _all_values(db_path, field)
+                                       max_count=hi, names=names))
+    allv = _all_values(db_path, field, names=names)
     if op == "eq":
         return field, {value} if value in allv else set()
     if op == "ne":
@@ -1265,11 +1426,14 @@ def _narrow_one(db_path, cond):
     return None
 
 
-def narrow_values(db_path, conditions, join="and"):
+def narrow_values(db_path, conditions, join="and", names=None):
     """算出每个条件字段上保留的值集合。
 
     同一字段的多个条件各自在**原始值集合**上计算, 再按 join 合并 ——
     不是在第一个条件的结果上继续过滤, 所以条件之间没有顺序依赖。
+
+    names: 当前范围(None=全库)。数量条件与否定条件(不等于/不包含)都
+           要在这个范围内算, 详见 _narrow_one / _all_values。
 
     返回 {字段: 保留的值集合}。作品级条件(为空/不为空)不出现在结果里。
     """
@@ -1277,7 +1441,7 @@ def narrow_values(db_path, conditions, join="and"):
         raise ValueError(f"非法组合符: {join}")
     per_field = {}
     for c in conditions or []:
-        got = _narrow_one(db_path, c)
+        got = _narrow_one(db_path, c, names=names)
         if got is None:
             continue
         field, vals = got
@@ -1305,17 +1469,34 @@ def no_value_names(db_path, conditions=None, join="and", field=None,
     该进「未分类」, 而不是整条被丢掉(那样它永远不会被分类/移动)。
     """
     conditions = list(conditions or [])
-    narrow = narrow_values(db_path, conditions, join)
+    narrow = narrow_values(db_path, conditions, join, names=names)
     work_level = [c for c in conditions
                   if (c.get("op") or "eq") in ("empty", "not_empty")]
-    where, args = build_where(work_level, join) if work_level else ("1=1", [])
+    has_wl = bool(work_level)
+    if has_wl:
+        wl_where, wl_args = build_where(work_level, join)
+    else:
+        wl_where, wl_args = "1=1", []
 
     conn = sqlite3.connect(db_path)
     try:
         scope = scope_clause(conn, names)
-        sql = ("SELECT a.name, a.id FROM archives a "
-               f"WHERE ({where}) AND ({scope})")
-        rows = conn.execute(sql, args).fetchall()
+        # join=and: 作品级条件可以直接在 SQL 里收窄。
+        # join=or : 作品级只是并列的一支, 不能拿它收窄 —— 否则
+        # `作者为空 OR 作者=alice` 会退化成"必须作者为空"。
+        if has_wl and join == "and":
+            sql = ("SELECT a.name, a.id FROM archives a "
+                   f"WHERE ({wl_where}) AND ({scope})")
+            rows = conn.execute(sql, wl_args).fetchall()
+            wl_ids = None
+        else:
+            rows = conn.execute(
+                f"SELECT a.name, a.id FROM archives a WHERE ({scope})"
+            ).fetchall()
+            wl_ids = ({r[0] for r in conn.execute(
+                "SELECT a.id FROM archives a "
+                f"WHERE ({wl_where}) AND ({scope})", wl_args)}
+                if has_wl else None)
         if not rows:
             return []
         # 这些作品在任意被收窄字段上是否还有值(没有 -> 被条件排除)
@@ -1331,9 +1512,13 @@ def no_value_names(db_path, conditions=None, join="and", field=None,
     out = []
     for name, aid in rows:
         have = mv.get(aid, {})
-        # 收窄字段上一个值都不剩 -> 这个作品被条件排除了
-        if any(not any(v in allowed for v in have.get(f, []))
-               for f, allowed in narrow.items()):
+        wl_hit = True if wl_ids is None else (aid in wl_ids)
+        vl_hit = _match_narrow(narrow, have, join)
+        if join == "or":
+            ok = (wl_hit if has_wl else False) or vl_hit
+        else:
+            ok = (wl_hit if has_wl else True) and vl_hit
+        if not ok:
             continue
         if not have.get(field):
             out.append(name)
@@ -1357,25 +1542,41 @@ def query_entries(db_path=DEFAULT_DB, conditions=None, join="and",
     不含路径 —— 库不记路径, 需要路径请用本次扫描结果或源目录扫描。
     """
     conditions = list(conditions or [])
-    narrow = narrow_values(db_path, conditions, join)
+    narrow = narrow_values(db_path, conditions, join, names=names)
 
-    # 作品级条件(为空/不为空)先用 SQL 圈定候选作品
+    # 作品级条件(为空/不为空)
     work_level = [c for c in conditions
                   if (c.get("op") or "eq") in ("empty", "not_empty")]
-    if work_level:
-        where, args = build_where(work_level, join)
+    has_wl = bool(work_level)
+    if has_wl:
+        wl_where, wl_args = build_where(work_level, join)
     else:
-        where, args = "1=1", []
+        wl_where, wl_args = "1=1", []
 
     conn = sqlite3.connect(db_path)
     try:
         scope = scope_clause(conn, names)
         cols = ["id", "name"] + META_COLUMNS
-        sql = ("SELECT a.id, a.name, "
-               + ",".join(f"m.{c}" for c in META_COLUMNS)
-               + " FROM archives a LEFT JOIN meta m ON m.archive_id=a.id "
-                 f"WHERE ({where}) AND ({scope}) ORDER BY a.name")
-        rows = conn.execute(sql, args).fetchall()
+        base = ("SELECT a.id, a.name, "
+                + ",".join(f"m.{c}" for c in META_COLUMNS)
+                + " FROM archives a LEFT JOIN meta m ON m.archive_id=a.id ")
+        wl_ids = None
+        # join=and: 作品级条件可以用 SQL 直接收窄(所有条件都要满足)。
+        # join=or : 作品级只是"其中一支", 不能拿它收窄 —— 否则
+        # `作者为空 OR 作者=alice` 会退化成"必须作者为空", alice 那支没了。
+        # 这时先算出命中作品级的那批 id, 再和值级结果在 Python 里取并集。
+        if has_wl and join == "and":
+            sql = base + f"WHERE ({wl_where}) AND ({scope}) ORDER BY a.name"
+            rows = conn.execute(sql, wl_args).fetchall()
+        elif has_wl:
+            sql = base + f"WHERE ({scope}) ORDER BY a.name"
+            rows = conn.execute(sql).fetchall()
+            wl_ids = {r[0] for r in conn.execute(
+                f"SELECT a.id FROM archives a "
+                f"WHERE ({wl_where}) AND ({scope})", wl_args)}
+        else:
+            rows = conn.execute(base + f"WHERE ({scope}) ORDER BY a.name"
+                                ).fetchall()
         # 收窄时把 meta_values 也一起收窄: 否则每次都要把 100 多万行
         # 全读一遍, 而真正用到的只是范围内那几十个作品的条目。
         mv_sql = "SELECT mv.archive_id, mv.field, mv.value FROM meta_values mv"
@@ -1405,14 +1606,19 @@ def query_entries(db_path=DEFAULT_DB, conditions=None, join="and",
     for r in rows:
         d = dict(zip(cols, r))
         aid = d["id"]
-        # 收窄后没有任何值的字段 -> 这个作品被条件排除了
-        skip = False
-        for f, allowed in narrow.items():
-            have = all_by.get(aid, {}).get(f, [])
-            if not any(v in allowed for v in have):
-                skip = True
-                break
-        if skip:
+        # 作品级那支是否命中。None 表示"没有作品级条件"或"and 下已在 SQL
+        # 里收窄(取到的行必然满足)"。
+        wl_hit = True if wl_ids is None else (aid in wl_ids)
+        # 值级那支: join 决定多个被收窄字段之间怎么合。
+        # 以前不管 join 都按 and 判, 于是 `作者=X OR 语言=日语` 里
+        # 只满足其中一个的作品会被整条丢掉 —— or 退化成了 and。
+        vl_hit = _match_narrow(narrow, all_by.get(aid, {}), join)
+        if join == "or":
+            # 作品级与值级是并列的两支, 任一命中即可
+            ok = (wl_hit if has_wl else False) or vl_hit
+        else:
+            ok = (wl_hit if has_wl else True) and vl_hit
+        if not ok:
             continue
         # limit 按**作品**计, 不按条目: 一个作品有多个值时会展开成多条,
         # 按条目截断会把它从中间切断, 分类时就只搬走一部分值。
@@ -1421,18 +1627,40 @@ def query_entries(db_path=DEFAULT_DB, conditions=None, join="and",
         works += 1
         meta = {k: d.get(k) for k in META_COLUMNS}
         for f in (fields if fields else MULTI_FIELDS):
+            have = vals_by.get((aid, f), [])
             # 被条件收窄过的字段用收窄后的集合
             if f in narrow:
                 allowed = narrow[f]
-                vals = [v for v in vals_by.get((aid, f), []) if v in allowed]
+                vals = [v for v in have if v in allowed]
+                # or 语义下: 这个作品是靠**别的字段**那支进来的, 本字段的
+                # 条件并没命中 —— 那就把本字段的值原样保留。不这么做的话
+                # `作者=X OR 语言=日语` 里靠语言进来的作品, 查作者条目时
+                # 会被本字段的收窄清空, 整条作品从结果里消失。
+                if not vals and join == "or":
+                    vals = list(have)
             else:
-                vals = vals_by.get((aid, f), [])
+                vals = have
             for v in vals:
                 out.append({"archive_id": aid, "name": d["name"],
                             "field": f, "value": v,
                             "meta": meta})
     out.sort(key=lambda e: (e["name"], e["field"], e["value"]))
     return out
+
+
+def _match_narrow(narrow, have, join="and"):
+    """作品在收窄字段上是否还该出现。
+
+    narrow: {字段: 允许的值集合}
+    have:   {字段: 该作品实际拥有的值}
+    join:   and -> 每个被收窄字段都要有值落在允许集合里
+            or  -> 任一被收窄字段命中即可
+    """
+    if not narrow:
+        return True
+    hits = [any(v in allowed for v in have.get(f, []))
+            for f, allowed in narrow.items()]
+    return any(hits) if join == "or" else all(hits)
 
 
 # ---------------------------------------------------------------- 分组目录
