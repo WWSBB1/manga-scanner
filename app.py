@@ -15,6 +15,7 @@ import sqlite3
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -24,6 +25,8 @@ sys.path.insert(0, BASE)
 import scanner
 import fileops
 import plugin_loader
+import source as src_layer
+import reader
 
 DB_PATH = os.environ.get("MANGA_DB",
                         os.path.join(BASE, "manga.db"))
@@ -64,6 +67,25 @@ def fmt_size(n):
     return f"{n:.1f}TB"
 
 
+def dir_usable(path):
+    """源/目标目录能不能用: 本地看目录是否存在, 远程交给数据源。
+
+    远程路径 `123:/a/b` 在本机根本不存在, 不能用 os.path.isdir 判。
+    """
+    if src_layer.is_remote(path):
+        return True
+    return os.path.isdir(path)
+
+
+def remote_note(path):
+    """远程路径的能力说明, 给界面/接口提示用。"""
+    if not src_layer.is_remote(path):
+        return None
+    return {"remote": True, "supports_copy": False,
+            "note": "远程模式: 仅支持移动, 不支持复制(123 云盘 WebDAV "
+                    "的 COPY 返回 500)"}
+
+
 # ================================================================ API
 
 class API:
@@ -71,14 +93,24 @@ class API:
     def scan_start(dirs, db, rescan, recursive=True):
         sid = f"scan_{int(time.time())}"
         SCAN_WORKERS[sid] = {"running": True, "stop": False,
-                             "log": [], "stats": None}
+                             "log": [], "stats": None,
+                             # 进度不是日志行: 界面把它渲染成一行固定文字,
+                             # 原地刷新。远程每个文件要一两秒, 930 个文件
+                             # 如果每行一条日志会滚成瀑布, 反而看不出进度。
+                             "progress": {"done": 0, "total": 0,
+                                          "current": "", "phase": "准备"}}
         w = SCAN_WORKERS[sid]
 
         def log_fn(msg):
             w["log"].append(msg)
 
-        def progress(done, total):
-            pass  # 日志里已有进度
+        def progress(done, total, current="", phase=""):
+            p = w["progress"]
+            p["done"], p["total"] = done, total
+            if current:
+                p["current"] = current
+            if phase:
+                p["phase"] = phase
 
         def worker():
             try:
@@ -111,7 +143,7 @@ class API:
         if not w:
             return {"error": "无效 scan_id"}
         return {"running": w["running"], "log": w["log"],
-                "stats": w["stats"]}
+                "progress": w.get("progress"), "stats": w["stats"]}
 
     @staticmethod
     def scan_stop(sid):
@@ -143,11 +175,163 @@ class API:
     @staticmethod
     def distinct(field, scope="scan"):
         try:
-            vals = scanner.distinct_values(DB_PATH, field,
-                                           names=API.scope_names(scope))
-            return {"values": [{"value": v, "count": c} for v, c in vals]}
+            names = API.scope_names(scope)
+            vals = scanner.distinct_values(DB_PATH, field, names=names)
+            # 下拉框按出现次数只取前 500 个。**必须说明截断了** —— 否则
+            # 用户在下拉框里找不到某个作者, 会以为库里没有, 其实只是排在后
+            # 面没列出来(实测 4958 个作者只列了 500 个)。
+            total = API._count_values(field, names)
+            return {"values": [{"value": v, "count": c} for v, c in vals],
+                    "total": total, "truncated": total > len(vals)}
         except Exception as ex:
             return {"error": str(ex)}
+
+    @staticmethod
+    def reader_list(src_dir, conditions, join, scope="scan", limit=200):
+        """阅读首页: 按条件筛出作品, 再从源目录定位本地文件。
+
+        库里不存路径, 文件在哪只能当场从 src_dir 扫出来。先按目录里的
+        名单收窄 SQL, 免得全库查询后再截断把目标漏掉。
+        """
+        try:
+            if not src_dir or not dir_usable(src_dir):
+                return {"error": "请填漫画所在的本地目录"}
+            if src_layer.is_remote(src_dir):
+                return {"error": "阅读器当前只支持本地目录"}
+            found = fileops.match_in_db(DB_PATH, src_dir, False)
+            paths = {i["name"]: i["src"] for i in found}
+            if not paths:
+                return {"items": [], "count": 0, "total": 0,
+                        "hint": "目录里没有已入库的漫画"}
+            # 范围必须下推到 SQL: 先按名字排序取前 limit 本再判断在不在目录里,
+            # 目录只有 195 本而库里有 4 万本时, 前 60 本可能一本都不在目录里。
+            conds = [c for c in (conditions or [])
+                     if (c.get("value") or "").strip()
+                     or c.get("op") in ("empty", "not_empty")]
+            base = API.scope_names(scope)
+            if base is None:
+                scoped = list(paths)
+            else:
+                scoped = [n for n in base if n in paths]
+            where, args = scanner.build_where(conds, join)
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                scope_sql = scanner.scope_clause(conn, scoped)
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM archives a "
+                    f"WHERE ({where}) AND ({scope_sql})", args).fetchone()[0]
+                cols = ["id", "name", "size"] + scanner.META_COLUMNS
+                rows = conn.execute(
+                    "SELECT " + ",".join("a." + c if c in ("id", "name", "size")
+                                        else "m." + c for c in cols) +
+                    " FROM archives a LEFT JOIN meta m ON m.archive_id=a.id "
+                    f"WHERE ({where}) AND ({scope_sql}) "
+                    "ORDER BY a.name LIMIT ?", args + [limit]).fetchall()
+            finally:
+                conn.close()
+            items = []
+            for r in rows:
+                d = dict(zip(cols, r))
+                if d["name"] not in paths:
+                    continue
+                items.append({"name": d["name"], "size": d["size"],
+                              "title": d.get("title") or "",
+                              "artist": d.get("artist") or "",
+                              "parody": d.get("parody") or "",
+                              "tags": d.get("tags") or "",
+                              "character": d.get("character") or "",
+                              "group_name": d.get("group_name") or "",
+                              "category": d.get("category") or "",
+                              "language": d.get("language") or ""})
+            return {"items": items, "count": len(items), "total": total,
+                    "in_dir": len(paths), "limit": limit}
+        except Exception as ex:
+            return {"error": str(ex)}
+
+    @staticmethod
+    def reader_pages(name, src_dir):
+        try:
+            if not src_dir or src_layer.is_remote(src_dir):
+                return {"error": "只支持本地目录"}
+            if not os.path.isdir(src_dir):
+                return {"error": "目录不存在"}
+            path = os.path.join(src_dir, name)
+            # 只允许源目录这一层的文件名, 不接受带斜杠/..的路径
+            if os.path.dirname(name) or name in (".", "..") \
+                    or not os.path.isfile(path):
+                return {"error": "找不到这个文件"}
+            pages = reader.list_pages(path)
+            if not pages:
+                return {"error": "不是可阅读的 zip, 或里面没有图片"}
+            return {"name": name, "pages": pages, "count": len(pages)}
+        except Exception as ex:
+            return {"error": str(ex)}
+
+    @staticmethod
+    def library_candidates(src_dir, q="", limit=40):
+        """已入库漫画的文件名候选, 供阅读页搜索文本框用。"""
+        try:
+            if not src_dir or not dir_usable(src_dir):
+                return {"values": []}
+            source = (src_layer.get_source(src_dir)
+                      if src_layer.is_remote(src_dir) else None)
+            found = fileops.match_in_db(DB_PATH, src_dir, False, source=source)
+            names = [i["name"] for i in found]
+            if q:
+                q = q.lower()
+                names = [n for n in names if q in n.lower()]
+            return {"values": names[:limit]}
+        except Exception:
+            return {"values": []}
+
+    @staticmethod
+    def reader_thumb(name, size, src_dir):
+        if not src_dir or src_layer.is_remote(src_dir):
+            return None
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            return None
+        path = os.path.join(src_dir, name)
+        if os.path.dirname(name) or name in (".", "..") \
+                or not os.path.isfile(path):
+            return None
+        return reader.get_thumb(name, size, path)
+
+    @staticmethod
+    def reader_page_image(name, src_dir, entry):
+        if not src_dir or src_layer.is_remote(src_dir) or os.path.dirname(name):
+            return None
+        path = os.path.join(src_dir, name)
+        if not os.path.isfile(path):
+            return None
+        return reader.get_page(path, entry)
+
+    @staticmethod
+    def _count_values(field, names):
+        """某字段在当前范围内的不同值总数(不受下拉框 500 上限影响)。"""
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            scope = scanner.scope_clause(conn, names)
+            return conn.execute(
+                "SELECT COUNT(DISTINCT mv.value) FROM meta_values mv "
+                "JOIN archives a ON a.id=mv.archive_id "
+                f"WHERE mv.field=? AND mv.value IS NOT NULL "
+                f"AND mv.value != '' AND ({scope})", (field,)).fetchone()[0]
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _count(where, args, names):
+        """符合条件的作品总数(不受 limit 影响)。用于判断结果是否被截断。"""
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            scope = scanner.scope_clause(conn, names)
+            return conn.execute(
+                "SELECT COUNT(*) FROM archives a "
+                f"WHERE ({where}) AND ({scope})", args).fetchone()[0]
+        finally:
+            conn.close()
 
     @staticmethod
     def query(field, value, contains, limit=2000, scope="scan"):
@@ -166,6 +350,10 @@ class API:
             args = [field, value]
         try:
             names = API.scope_names(scope)
+            # 先数总数, 再取这一页 —— 单看 count 分不清"就这么多"和
+            # "被 limit 截断了"。截断却不提示, 用户会以为这就是全部,
+            # 照着它去判断/分类就漏了。
+            total = API._count(where, args, names)
             cols, rows = scanner.list_archives(DB_PATH, where, args, limit,
                                                names=names)
             # 多值字段的条目数, 供前端显示 [N] 徽标。
@@ -182,7 +370,6 @@ class API:
                             f"WHERE archive_id IN ({ph}) "
                             "GROUP BY archive_id, field", page_ids):
                         cnt.setdefault(aid, {})[f] = n
-                    cnt.setdefault(aid, {})[f] = n
                 name_to_id = dict(conn.execute("SELECT name, id FROM archives"))
             finally:
                 conn.close()
@@ -191,7 +378,8 @@ class API:
                 d = dict(zip(cols, r))
                 counts.append(cnt.get(name_to_id.get(d.get("name")), {}))
             return {"columns": cols, "rows": rows, "count": len(rows),
-                    "value_counts": counts}
+                    "total": total, "truncated": total > len(rows),
+                    "limit": limit, "value_counts": counts}
         except Exception as ex:
             return {"error": str(ex)}
 
@@ -215,10 +403,14 @@ class API:
 
     @staticmethod
     def source_list(src_dir, recursive):
-        """列出源目录下已入库的压缩包(库里没有的忽略)。"""
+        """列出源目录下已入库的压缩包(库里没有的忽略)。支持远程源。"""
         try:
-            items = fileops.match_in_db(DB_PATH, src_dir, recursive)
-            return {"items": items, "count": len(items)}
+            source = (src_layer.get_source(src_dir)
+                      if src_layer.is_remote(src_dir) else None)
+            items = fileops.match_in_db(DB_PATH, src_dir, recursive,
+                                        source=source)
+            return {"items": items, "count": len(items),
+                    "remote": remote_note(src_dir)}
         except Exception as ex:
             return {"error": str(ex)}
 
@@ -236,14 +428,23 @@ class API:
             if not src_dir:
                 return {"error": "请先填源目录 —— 库不记文件路径,"
                                  "要知道文件在哪才能算出目标"}
-            if not os.path.isdir(src_dir):
+            if not dir_usable(src_dir):
                 return {"error": f"源目录不存在: {src_dir}"}
+            # 目标与源必须在同一存储上(都本地, 或同一个 rclone remote)。
+            # 跨存储只能是下载再上传, 本次不做 —— 与其悄悄变慢, 不如直说。
+            if not src_layer.same_store(src_dir, base_dir):
+                return {"error": "源目录与目标目录必须在同一存储上 "
+                                 "(都为本地, 或同一个 rclone remote); "
+                                 "跨存储搬运需要下载再上传, 暂不支持"}
             # 先拿到源目录里都有哪些文件, 再让查询**在 SQL 层**按这个
             # 名单收窄。顺序不能反: 查询有 limit(按 name 排序取前 N),
             # 先查全库再过滤的话, 名字排在后面的目标会被 limit 截掉,
             # 界面就报"没有可分类的"。
-            paths = {i["name"]: i["src"] for i in
-                     fileops.match_in_db(DB_PATH, src_dir, recursive)}
+            source = (src_layer.get_source(src_dir)
+                      if src_layer.is_remote(src_dir) else None)
+            found = fileops.match_in_db(DB_PATH, src_dir, recursive,
+                                        source=source)
+            paths = {i["name"]: i["src"] for i in found}
             # limit 按作品计。范围已经收窄到源目录, 所以上限就取源目录里
             # 的文件数 —— 用默认 5000 的话, 源目录超过 5000 个文件时会
             # 静默漏掉一部分, 用户还以为都处理了。
@@ -269,22 +470,39 @@ class API:
                     by_name.setdefault(n, [])
             names = list(by_name)
             # paths 只包含源目录里真实存在的文件; 源目录没填时为空 ->
-            # exists_src 全 False, 预览会提示"找不到", 这是诚实的
-            plan = fileops.plan_transfer(DB_PATH, names, base_dir, group_by,
-                                         entries=by_name, group_dir=group_dir,
-                                         paths=paths,
-                                         fallback_names=fallback)
+            # exists_src 全 False, 预览会提示"找不到", 这是诚实的。
+            # 远程也用真实判断(查后端清单), 不能用恒 True 的回调 ——
+            # 那会让"文件已经被搬走"在预览里看不出来。
+            remote = src_layer.is_remote(src_dir)
+            if remote:
+                def _exists(p):
+                    return source.exists(fileops._rel_of(p, source.root))
+            else:
+                _exists = os.path.isfile
+            plan = fileops.plan_transfer(
+                DB_PATH, names, base_dir, group_by,
+                entries=by_name, group_dir=group_dir, paths=paths,
+                fallback_names=fallback, exists=_exists)
             # 预览按条目展开: 一个作品多个值就是多行
             rows = []
             for p in plan:
                 for t in p["targets"]:
                     rows.append({"name": p["name"], "src": p["src"],
                                  "dest_dir": t,
-                                 "dest": os.path.join(t, p["name"]),
+                                 "dest": src_layer.join(t, p["name"]),
                                  "targets": p["targets"],
                                  "exists_src": p["exists_src"]})
+            # 扇出上限丢值的作品: 必须说出来, 不能让用户以为都归档了
+            truncated = [{"name": p["name"], "dropped": p["dropped"]}
+                         for p in plan if p.get("dropped")]
+            # 不同值清理后同名、会并进同一目录的作品
+            merged = [{"name": p["name"], "merged": p["merged"]}
+                      for p in plan if p.get("merged")]
             return {"plan": plan, "rows": rows, "count": len(plan),
                     "entry_count": len(rows),
+                    "truncated": truncated, "merged": merged,
+                    "remote": remote_note(src_dir),
+                    "copy_unsupported": bool(remote),
                     "missing": [p["name"] for p in plan
                                 if not p.get("exists_src")]}
         except Exception as ex:
@@ -319,11 +537,21 @@ class API:
                     w["result"] = {"error": "请先填源目录 —— 库不记文件路径,"
                                             "要知道文件在哪才能搬"}
                     return
-                if not os.path.isdir(src_dir):
+                if not dir_usable(src_dir):
                     w["result"] = {"error": f"源目录不存在: {src_dir}"}
                     return
+                # 目标与源必须同一存储(都本地, 或同一个 rclone remote)
+                if not src_layer.same_store(src_dir, dest):
+                    w["result"] = {
+                        "error": "源目录与目标目录必须在同一存储上 "
+                                 "(都为本地, 或同一个 rclone remote); "
+                                 "跨存储搬运需要下载再上传, 暂不支持"}
+                    return
+                remote = src_layer.is_remote(src_dir)
+                source = src_layer.get_source(src_dir) if remote else None
                 paths = {i["name"]: i["src"] for i in
-                         fileops.match_in_db(DB_PATH, src_dir, recursive)}
+                         fileops.match_in_db(DB_PATH, src_dir, recursive,
+                                             source=source)}
                 # 同样在 SQL 层按源目录收窄; limit 取源目录文件数,
                 # 免得超过默认上限时静默漏掉一部分文件
                 entries = scanner.query_entries(
@@ -343,7 +571,11 @@ class API:
                     for n in fallback:
                         by_name.setdefault(n, [])
                 use_names = list(by_name)
-                if approved:
+                # approved 是**上界**, 且"空列表"要当成"什么都没确认",
+                # 不能当成"不设限"。用 `if approved:` 判的话, 空名单会让
+                # 收窄整段跳过 -> 条件命中的文件**全部**被搬走 —— 移动
+                # 不可逆, 这正是最该防的: 预览里一个都没确认, 结果全搬了。
+                if approved is not None:
                     allowed = set(approved)
                     dropped = [n for n in use_names if n not in allowed]
                     use_names = [n for n in use_names if n in allowed]
@@ -360,12 +592,16 @@ class API:
                     log=log_fn, progress=progress,
                     stop_flag=lambda: w["stop"], group_by=group_by,
                     entries=by_name, group_dir=group_dir, paths=paths,
-                    fallback_names=fallback)
+                    fallback_names=fallback, source=source)
                 w["result"] = result
                 w["errors"] = errs
             except Exception as ex:
                 w["result"] = {"error": str(ex)}
             finally:
+                # 不管成功失败都要丢掉清单缓存: 失败时可能已经搬走了一部分,
+                # 留着旧清单会让下次预览显示错误的位置。
+                if src_layer.is_remote(src_dir or ""):
+                    src_layer.drop_source(src_dir)
                 w["running"] = False
 
         t = threading.Thread(target=worker, daemon=True)
@@ -389,39 +625,53 @@ class API:
         return {"error": "无效 cls_id"}
 
     @staticmethod
-    def stats():
-        """总览: 各字段的基数概览(不含明细,明细走 /api/stat_field)。"""
+    def stats(scope="scan"):
+        """总览: 各字段的基数概览(不含明细,明细走 /api/stat_field)。
+
+        scope 默认 "scan": 只统计**本次扫描到的**那些文件, 不是整库 ——
+        库里还堆着以前扫过的作品, 把它们算进来会让"这次扫完效果如何"
+        永远看不出来。"all" 才是全库。
+        """
         try:
+            names = API.scope_names(scope)
             conn = sqlite3.connect(DB_PATH)
             try:
+                scope_sql = scanner.scope_clause(conn, names)
                 total = conn.execute(
-                    "SELECT COUNT(*) FROM archives").fetchone()[0]
-                with_meta = conn.execute(
-                    "SELECT COUNT(*) FROM archives WHERE has_meta=1"
+                    f"SELECT COUNT(*) FROM archives a WHERE ({scope_sql})"
                     ).fetchone()[0]
+                with_meta = conn.execute(
+                    f"SELECT COUNT(*) FROM archives a "
+                    f"WHERE a.has_meta=1 AND ({scope_sql})").fetchone()[0]
                 errors = conn.execute(
-                    "SELECT COUNT(*) FROM archives WHERE error IS NOT NULL"
+                    f"SELECT COUNT(*) FROM archives a "
+                    f"WHERE a.error IS NOT NULL AND ({scope_sql})"
                     ).fetchone()[0]
                 # 各字段: 不同值个数 + 条目总数, 供字段选择器显示规模。
                 # 只统计有分类意义的字段(见 scanner.STAT_FIELDS)
+                # 用 archive_id IN (子查询) 而不是 JOIN archives: JOIN 会让
+                # 优化器顺着 idx_mv_field_value(field,value) 先扫该字段的
+                # 全部行(全库 120 万), 2000 个文件的范围实测要 52 秒;
+                # IN 子查询则先收窄出范围内的 id, 再按 idx_mv_archive 取。
+                # 所有字段一次 GROUP BY 拿全: 逐字段各查一次要 8 遍扫描,
+                # 实测 2.7 秒, 合成一句 0.08 秒。
+                in_scope = (f"mv.archive_id IN (SELECT a.id FROM archives a "
+                            f"WHERE {scope_sql})")
+                counts = {
+                    f: (n, m) for f, n, m in conn.execute(
+                        "SELECT mv.field, COUNT(DISTINCT mv.value), COUNT(*) "
+                        "FROM meta_values mv "
+                        f"WHERE {in_scope} GROUP BY mv.field")}
                 fields = []
                 for f in scanner.STAT_FIELDS:
-                    n = conn.execute(
-                        "SELECT COUNT(DISTINCT value) FROM meta_values "
-                        "WHERE field=?", (f,)).fetchone()[0]
-                    m = conn.execute(
-                        "SELECT COUNT(*) FROM meta_values WHERE field=?",
-                        (f,)).fetchone()[0]
+                    n, m = counts.get(f, (0, 0))
                     if n:
                         fields.append({"field": f, "distinct": n,
                                        "entries": m})
                 fields.sort(key=lambda x: -x["distinct"])
                 avg_tags = 0
                 if total:
-                    te = conn.execute(
-                        "SELECT COUNT(*) FROM meta_values WHERE field='tags'"
-                        ).fetchone()[0]
-                    avg_tags = round(te / total, 1)
+                    avg_tags = round(counts.get("tags", (0, 0))[1] / total, 1)
             finally:
                 conn.close()
             return {"total": total, "with_meta": with_meta,
@@ -431,9 +681,11 @@ class API:
             return {"error": str(ex)}
 
     @staticmethod
-    def stat_field(field, limit=20, offset=0, q="", sort="count"):
+    def stat_field(field, limit=20, offset=0, q="", sort="count",
+                   scope="scan"):
         """某字段的分布明细, 分页 + 搜索。
 
+        scope:        "scan"(默认) 只算本次扫描到的 | "all" 全库
         limit/offset: 分页, 避免一次拉几万行
         q:            过滤值(子串匹配)
         sort:         count(按作品数) | name(按名称)
@@ -443,26 +695,37 @@ class API:
         if field not in scanner.STAT_FIELDS:
             return {"error": f"非法字段: {field}"}
         try:
+            names = API.scope_names(scope)
             conn = sqlite3.connect(DB_PATH)
             try:
-                where, args = "field=?", [field]
+                scope_sql = scanner.scope_clause(conn, names)
+                # 范围条件里用到了 archives(a.name), 所以必须收窄 archive_id。
+                # 走 IN 子查询而不是 JOIN: JOIN 时优化器会先按
+                # idx_mv_field_value(field,value) 扫该字段全部行(全库 120 万),
+                # 范围小的时候反而慢上百倍。
+                src = ("FROM meta_values mv "
+                       "WHERE mv.field=? AND "
+                       f"mv.archive_id IN (SELECT a.id FROM archives a "
+                       f"WHERE {scope_sql})")
+                args = [field]
                 if q:
-                    where += " AND value LIKE ?"
+                    src += " AND mv.value LIKE ?"
                     args.append(f"%{q}%")
                 total_values = conn.execute(
-                    f"SELECT COUNT(DISTINCT value) FROM meta_values "
-                    f"WHERE {where}", args).fetchone()[0]
-                order = "value ASC" if sort == "name" else "c DESC, value ASC"
+                    f"SELECT COUNT(DISTINCT mv.value) {src}", args
+                    ).fetchone()[0]
+                order = ("mv.value ASC" if sort == "name"
+                         else "c DESC, mv.value ASC")
                 rows = conn.execute(
-                    f"SELECT value, COUNT(DISTINCT archive_id) c "
-                    f"FROM meta_values WHERE {where} GROUP BY value "
+                    f"SELECT mv.value, COUNT(DISTINCT mv.archive_id) c "
+                    f"{src} GROUP BY mv.value "
                     f"ORDER BY {order} LIMIT ? OFFSET ?",
                     args + [limit, offset]).fetchall()
                 # 本级之外还剩多少(长尾折叠)
                 tail = conn.execute(
                     f"SELECT COUNT(*), COALESCE(SUM(c),0) FROM ("
-                    f"  SELECT COUNT(DISTINCT archive_id) c FROM meta_values "
-                    f"  WHERE {where} GROUP BY value "
+                    f"  SELECT COUNT(DISTINCT mv.archive_id) c {src} "
+                    f"  GROUP BY mv.value "
                     f"  ORDER BY {order} LIMIT -1 OFFSET ?)",
                     args + [offset + limit]).fetchone()
             finally:
@@ -534,6 +797,23 @@ checkbox-row{display:block;margin:4px 0}
 .cond select,.cond input{flex:1;min-width:80px;font-size:13px;padding:6px}
 .cond .del{background:#ef5350;padding:6px 10px;font-size:13px;flex:0 0 auto}
 .cond-idx{font-size:11px;color:#999;width:24px;flex:0 0 auto;text-align:center}
+/* 值输入框 + 历史按钮: 输入框占满, 按钮挂在右边缘, 不额外占宽度 */
+.c-val-wrap{position:relative;flex:1;min-width:80px;display:flex}
+.c-val-wrap input{width:100%;padding-right:30px}
+.c-val-wrap .hist-btn{position:absolute;right:1px;top:1px;bottom:1px;width:26px;
+  padding:0;font-size:13px;line-height:1;background:transparent;color:#999;
+  border:none;border-left:1px solid #eee;border-radius:0 5px 5px 0}
+.c-val-wrap .hist-btn:hover{background:#f0f0f0;color:#1976d2}
+.hist-pop{position:absolute;right:0;top:calc(100% + 2px);z-index:150;
+  background:#fff;border:1px solid #ddd;border-radius:6px;min-width:160px;
+  max-width:calc(100vw - 32px);max-height:190px;overflow-y:auto;
+  box-shadow:0 4px 12px rgba(0,0,0,.15);padding:4px 0}
+.hist-pop .hint{font-size:11px;color:#999;padding:4px 10px;border-bottom:1px solid #f0f0f0}
+.hist-pop .hi{font-size:13px;padding:7px 10px;cursor:pointer;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.hist-pop .hi:hover{background:#e3f2fd}
+.hist-pop .hi .hi-x{float:right;color:#bbb;margin-left:8px}
+.hist-pop .hi .hi-x:hover{color:#ef5350}
 .dest-path{font-size:11px;color:#2e7d32;word-break:break-all}
 /* 文件名完整显示不截断, 长名字靠换行容纳 */
 #cls-table td:first-child{word-break:break-all}
@@ -547,11 +827,142 @@ checkbox-row{display:block;margin:4px 0}
   z-index:200;display:none;align-items:center;justify-content:center}
 #detail-modal.show{display:flex}
 #detail-modal>.card{width:90%;max-width:500px;max-height:80vh;overflow-y:auto}
+
+/* 阅读首页 */
+.rd-fav{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
+.rd-chip{display:inline-flex;align-items:center;gap:2px;font-size:13px;
+  padding:3px 3px 3px 10px;border-radius:16px;border:1px solid #ddd;
+  background:#fff;color:#555;cursor:pointer;white-space:nowrap}
+.rd-chip.on{background:#1976d2;color:#fff;border-color:#1976d2}
+.rd-chip .rd-label{cursor:pointer}
+.rd-chip .rd-del{display:inline-flex;align-items:center;justify-content:center;
+  width:28px;height:28px;margin-left:2px;border-radius:50%;
+  font-size:17px;line-height:1;color:#999;background:transparent;
+  border:none;padding:0;cursor:pointer;touch-action:manipulation}
+.rd-chip .rd-del:hover,.rd-chip .rd-del:active{background:#ffebee;color:#d32f2f}
+.rd-chip .rd-del.confirm{width:auto;border-radius:14px;padding:0 9px;
+  background:#d32f2f;color:#fff;font-size:12px;font-weight:bold}
+.rd-chip .rd-del.confirm:hover,.rd-chip .rd-del.confirm:active{background:#b71c1c;color:#fff}
+.rd-chip.on .rd-del{color:#fff}
+.rd-chip.on .rd-del:hover,.rd-chip.on .rd-del:active{background:#fff;color:#d32f2f}
+.rd-chip.fav::before{content:'★';color:#f9a825;margin-right:4px}
+.rd-chip.on.fav::before{color:#fff}
+.rd-grid{display:grid;gap:2px;grid-template-columns:repeat(2,1fr);margin:0 -12px;background:#000}
+.rd-card{background:#fff;border-radius:0;overflow:hidden;box-shadow:none;
+  cursor:pointer}
+.rd-thumb{width:100%;aspect-ratio:3/4;background:#eee;object-fit:cover;display:block}
+.rd-meta{padding:3px 5px;background:#fff}
+.rd-name{font-size:12px;line-height:1.35;word-break:break-all;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.rd-sub{font-size:11px;color:#888;margin-top:2px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.rd-loading{font-size:12px;color:#999;text-align:center;padding:12px}
+/* 分组视图: 左侧竖排组名, 右侧横滑缩略图 */
+.rd-grow{display:flex;align-items:stretch;border-bottom:1px solid #ddd;min-height:148px}
+.rd-glabel{width:22px;flex:0 0 22px;writing-mode:vertical-rl;text-orientation:mixed;
+  display:flex;align-items:center;justify-content:center;font-size:11px;
+  background:#f5f5f5;color:#555;word-break:break-all;padding:6px 0}
+.rd-gstrip{flex:1;display:flex;gap:6px;overflow-x:auto;padding:6px;
+  -webkit-overflow-scrolling:touch;min-width:0}
+.rd-gcard{flex:0 0 104px;width:104px;cursor:pointer}
+.rd-gcard img{width:104px;height:140px;object-fit:cover;background:#eee;
+  border-radius:3px;display:block}
+.rd-gname{font-size:12px;line-height:1.35;color:#555;margin-top:3px;
+  word-break:break-all;display:-webkit-box;-webkit-line-clamp:2;
+  -webkit-box-orient:vertical;overflow:hidden}
+.rd-gmore{flex:0 0 44px;width:44px;border:none;border-left:1px solid #eee;
+  background:#fafafa;font-size:12px;color:#1976d2;cursor:pointer;padding:0}
+.rd-gexpand{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;
+  padding:6px;background:#fafafa}
+.rd-gexpand .rd-thumb{aspect-ratio:3/4}
+/* 阅读器: 全屏翻页 */
+html.rd-open,body.rd-open{height:100%;overflow:hidden;overscroll-behavior:none}
+body.rd-open .nav{display:none}
+#reader-modal{position:fixed;inset:0;background:#111;z-index:1000;display:none;
+  flex-direction:column;overscroll-behavior:contain}
+#reader-modal.show{display:flex}
+.rd-top{display:flex;align-items:center;gap:8px;padding:8px 10px;color:#fff;
+  background:rgba(0,0,0,.7);font-size:13px;flex:0 0 auto}
+.rd-top .rd-title{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rd-top button{padding:5px 10px;font-size:13px;background:#333;color:#fff;
+  border-radius:5px;white-space:nowrap}
+.rd-top button.mode{background:#1565c0}
+.rd-stage{flex:1;min-height:0;overflow:hidden;display:flex;align-items:center;
+  justify-content:center;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
+.rd-stage.scroll-mode{display:block;overflow-y:auto;overscroll-behavior:contain;
+  touch-action:pan-y}
+.rd-stage img{width:100%;max-width:900px;display:block}
 </style>
 </head>
 <body>
 
 <div class="content" id="app">
+
+<!-- ===== 阅读首页 ===== -->
+<div id="page-read" class="page">
+<h2>📖 阅读</h2>
+<div class="card">
+  <div class="row">
+    <input type="text" id="rd-dir" value="/storage/emulated/0/Download">
+    <button class="outline" onclick="rdLoad()">刷新</button>
+  </div>
+  <div class="row">
+    <label style="font-size:13px">每行
+      <select id="rd-cols" onchange="rdApplyCols()" style="padding:4px">
+        <option value="2">2 本</option>
+        <option value="3">3 本</option>
+        <option value="4">4 本</option>
+      </select>
+    </label>
+    <label style="font-size:13px">视图
+      <select id="rd-view" onchange="rdChangeView()" style="padding:4px">
+        <option value="grid">网格</option>
+        <option value="artist">按作者</option>
+        <option value="tags">按标签</option>
+        <option value="parody">按原作</option>
+        <option value="character">按角色</option>
+        <option value="group_name">按社团</option>
+        <option value="category">按分类</option>
+        <option value="language">按语言</option>
+      </select>
+    </label>
+    <span id="rd-count" style="font-size:12px;color:#666"></span>
+  </div>
+</div>
+<div class="card">
+  <div class="row" style="justify-content:space-between;margin-bottom:4px">
+    <b>筛选</b>
+    <select id="rd-join" style="font-size:13px;padding:5px">
+      <option value="and">满足全部</option>
+      <option value="or">满足任一</option>
+    </select>
+  </div>
+  <div class="row rd-filter-row" style="margin:0;gap:4px">
+    <select id="rd-field" style="flex:0 0 52px;min-width:52px;font-size:13px;padding:6px 0;
+      text-align:center;text-align-last:center;-webkit-appearance:none;appearance:none">
+      <option value="tags">标签</option>
+      <option value="artist">作者</option>
+      <option value="group_name">社团</option>
+      <option value="parody">原作</option>
+      <option value="character">角色</option>
+      <option value="category">分类</option>
+      <option value="language">语言</option>
+      <option value="title">标题</option>
+    </select>
+    <input type="text" id="rd-quick" placeholder="输入筛选, 回车收藏"
+           oninput="rdQuickInput()" onkeydown="rdQuickKey(event)"
+           style="flex:1;min-width:60px;font-size:13px;padding:6px">
+    <button type="button" class="outline" id="rd-manage-btn"
+            onclick="rdToggleFavManage()" style="flex:0 0 auto;font-size:12px;padding:6px 8px;white-space:nowrap">管理</button>
+    <button type="button" class="outline" onclick="rdAddCond()"
+            style="flex:0 0 auto;font-size:12px;padding:6px 8px;white-space:nowrap">+条件</button>
+  </div>
+  <div class="rd-fav" id="rd-favs"></div>
+  <div id="rd-conds"></div>
+</div>
+<div class="rd-grid" id="rd-grid"></div>
+<div id="rd-more" style="text-align:center;margin:10px 0"></div>
+</div>
 
 <!-- ===== 扫描页 ===== -->
 <div id="page-scan" class="page">
@@ -569,8 +980,14 @@ checkbox-row{display:block;margin:4px 0}
   </div>
   <div style="font-size:12px;color:#666;margin-top:6px">
     不勾「扫描子目录」时只看这一层, 子目录里的文件不会被扫到。
+    <br>也可以填 rclone 远程路径, 例如 <code>123:/本图/本子zip</code>
+    (本地和远程不能混在同一次扫描里, 请分开扫)。
   </div>
   <div class="progress hidden" id="scan-prog"><div class="progress-fill" style="width:0"></div></div>
+  <!-- 进度固定一行, 原地刷新。远程每个文件要一两秒, 不能靠日志滚动
+       表达进度(930 个文件会刷成瀑布), 所以单独一行显示"已处理 N/M"。 -->
+  <div id="scan-progress-line"
+       style="font-size:13px;color:#555;margin:4px 0;display:none"></div>
   <div id="scan-status">就绪</div>
 </div>
 <div class="card">
@@ -627,7 +1044,7 @@ checkbox-row{display:block;margin:4px 0}
   <div style="margin-top:8px">
     <label style="font-size:12px;color:#666">源目录 (只处理这里的文件,库里没有的忽略)</label>
     <input type="text" id="cls-src" value="/storage/emulated/0/Download"
-           oninput="syncDest()">
+           oninput="syncDest();updateRemoteNote()">
     <label style="display:block;margin-top:6px">
       <input type="checkbox" id="cls-recursive"> 递归子目录
     </label>
@@ -650,8 +1067,9 @@ checkbox-row{display:block;margin:4px 0}
   <b>3. 目标位置</b>
   <label style="display:block;margin-top:8px;font-size:12px;color:#666">基础目录</label>
   <input type="text" id="cls-dest" value="/storage/emulated/0/Download"
-         oninput="destTouched=true">
-  <label style="display:block;margin-top:8px;font-size:12px;color:#666">按字段建子目录</label>
+         oninput="destTouched=true;updateRemoteNote()">
+  <label style="display:block;margin-top:8px;font-size:12px;color:#666">按字段建子目录
+    <span style="color:#999">(跟随筛选条件第 1 条, 可手动改)</span></label>
   <select id="cls-groupby" onchange="updateDestHint()">
     <option value="artist">按作者</option>
     <option value="parody">按原作</option>
@@ -672,10 +1090,11 @@ checkbox-row{display:block;margin:4px 0}
 <div class="card">
   <b>4. 执行</b>
   <div class="row" style="margin-top:8px">
-    <label><input type="radio" name="mode" value="copy"> 复制</label>
+    <label><input type="radio" name="mode" value="copy" id="cls-mode-copy"> 复制</label>
     <label><input type="radio" name="mode" value="move" checked> 移动</label>
     <label><input type="checkbox" id="cls-preview" checked> 先预览</label>
   </div>
+  <div id="cls-remote-note" style="font-size:12px;color:#e65100;margin-top:6px"></div>
   <div class="row">
     <button onclick="doPreview()">预览</button>
     <button onclick="doClassify()" id="cls-run">直接执行</button>
@@ -707,7 +1126,19 @@ checkbox-row{display:block;margin:4px 0}
 <!-- ===== 统计页 ===== -->
 <div id="page-stats" class="page hidden">
 <h2>📊 统计</h2>
-<div class="card" id="stats-overview"><button onclick="loadStats()">刷新统计</button></div>
+<div class="card" id="stats-overview">
+  <div class="row">
+    <select id="stats-scope" onchange="onStatScopeChange()">
+      <option value="scan">本次扫描到的</option>
+      <option value="all">全部库</option>
+    </select>
+    <span id="stats-scope-hint" style="font-size:12px;color:#666"></span>
+  </div>
+  <div id="stats-summary" style="margin-top:8px"></div>
+  <div class="row" style="margin-top:8px">
+    <button onclick="loadStats()">刷新统计</button>
+  </div>
+</div>
 
 <div class="card">
   <label style="font-size:12px;color:#666">选择字段看分布</label>
@@ -758,11 +1189,26 @@ checkbox-row{display:block;margin:4px 0}
 
 <!-- 底部导航 -->
 <nav class="nav">
+  <a onclick="showPage('read')" id="nav-read"><span class="icon">📖</span>阅读</a>
   <a onclick="showPage('scan')" id="nav-scan"><span class="icon">📦</span>扫描</a>
   <a onclick="showPage('browse')" id="nav-browse"><span class="icon">🔍</span>浏览</a>
   <a onclick="showPage('classify')" id="nav-classify"><span class="icon">📂</span>分类</a>
   <a onclick="showPage('stats')" id="nav-stats"><span class="icon">📊</span>统计</a>
 </nav>
+
+<!-- 阅读器弹层 -->
+<div id="reader-modal">
+  <div class="rd-top">
+    <button onclick="rdClose()">← 返回</button>
+    <span class="rd-title" id="rd-view-title"></span>
+    <span id="rd-page-no" style="font-size:12px"></span>
+    <button class="mode" id="rd-mode-btn" onclick="rdCycleMode()">→→</button>
+  </div>
+  <div class="rd-stage" id="rd-stage"
+       onclick="rdStageClick(event)"
+       ontouchstart="rdTouchStart(event)"
+       ontouchend="rdTouchEnd(event)"></div>
+</div>
 
 <script>
 let scanId=null, clsId=null, pollTimer=null, clsPollTimer=null;
@@ -778,12 +1224,367 @@ function showPage(p){
   document.getElementById('page-'+p).classList.remove('hidden');
   document.querySelectorAll('.nav a').forEach(a=>a.classList.remove('active'));
   document.getElementById('nav-'+p).classList.add('active');
-  // 统计页首次进入自动加载, 不用手动点刷新
-  if(p==='stats'&&!statsLoaded)loadStats();
+  // 统计页每次进来都重新拉: 默认范围是"本次扫描到的", 刚扫完就切过来
+  // 必须看到这次的新数字, 缓存住会一直显示上一次的
+  if(p==='stats')loadStats();
   // 浏览页同理: 进来就按当前范围(默认"本次扫描到的")显示
   if(p==='browse'){loadScopeHint();loadDistinct();doQuery();}
+  if(p==='read'){rdRenderFavs();rdLoad();}
 }
-showPage('scan');
+
+// ---- 阅读 ----
+const RD_FIELDS={tags:'标签',artist:'作者',group_name:'社团',parody:'原作',
+  character:'角色',category:'分类',language:'语言',title:'标题'};
+let rdFavs=JSON.parse(localStorage.getItem('manga_rd_favs')||'[]');
+let rdSel=[], rdItems=[], rdView=null, rdPageIdx=0, rdQuickTimer=null, rdHistoryPushed=false, rdDelTimer=null, rdManageFavs=false;
+let rdExpanded=new Set();
+function rdViewMode(){const v=localStorage.getItem('manga_rd_view')||'grid';
+  return document.getElementById('rd-view')&&v!=='grid'?v:'grid'}
+function rdChangeView(){const v=document.getElementById('rd-view').value;
+  localStorage.setItem('manga_rd_view',v);rdExpanded.clear();rdRenderView()}
+function rdNatural(a,b){const re=/(\d+)/g,A=String(a).split(re),B=String(b).split(re);
+  for(let i=0;i<Math.min(A.length,B.length);i++){
+    const x=A[i],y=B[i];
+    if(/^\d+$/.test(x)&&/^\d+$/.test(y)){const d=parseInt(x)-parseInt(y);if(d)return d}
+    else if(x.toLowerCase()!==y.toLowerCase())return x.toLowerCase()<y.toLowerCase()?-1:1;
+  }return A.length-B.length}
+function rdSplit(raw,field){const out=[],seen={};
+  for(const part of String(raw||'').split(/[,，]/)){
+    const v=part.trim();if(!v||/^unknown$/i.test(v)||seen[v])continue;
+    if(field==='parody'&&/^original$/i.test(v))continue;
+    seen[v]=1;out.push(v);
+  }return out}
+function rdGroups(){const field=rdViewMode();const map={};
+  for(const it of rdItems){
+    const vals=field==='title'||field==='grid'?[]:rdSplit(it[field],field);
+    for(const v of vals.length?vals:['未分类'])(map[v]=map[v]||[]).push(it);
+  }
+  // 按每组作品数降序; 数量相同按名称自然序, 未分类永远最后
+  return Object.keys(map).sort((a,b)=>
+    a==='未分类'?1:b==='未分类'?-1:map[b].length-map[a].length||rdNatural(a,b))
+    .map(label=>({label,items:map[label].sort((a,b)=>rdNatural(a.name,b.name))}))}
+function rdRenderGroups(){const grid=document.getElementById('rd-grid');
+  // 分组模式: 一组一行, 不受"每行 2/3/4 本"影响
+  grid.classList.remove('rd-grid');grid.style.gridTemplateColumns='';
+  grid.classList.add('rd-group-list');
+  const groups=rdGroups();
+  grid.innerHTML=groups.map((g,i)=>{
+    const exp=rdExpanded.has(g.label);
+    const cards=g.items.slice(0,10).map(it=>{
+      const idx=rdItems.indexOf(it);
+      return '<div class="rd-gcard" onclick="rdOpen('+idx+')">'+
+        '<img alt="" data-name="'+esc(it.name)+'" data-size="'+it.size+'">'+
+        '<div class="rd-gname">'+esc(it.title||it.name)+'</div></div>';
+    }).join('');
+    const rest=exp?'<div class="rd-gexpand">'+g.items.map(it=>{
+      const idx=rdItems.indexOf(it);
+      return '<div class="rd-card" onclick="rdOpen('+idx+')">'+
+        '<img class="rd-thumb" alt="" data-name="'+esc(it.name)+'" data-size="'+it.size+'">'+
+        '<div class="rd-meta"><div class="rd-name">'+esc(it.title||it.name)+'</div></div></div>';
+    }).join('')+'</div>':'';
+    return '<div class="rd-grow"><div class="rd-glabel" title="'+esc(g.label)+'">'+esc(g.label)+'('+g.items.length+')</div>'+
+      '<div class="rd-gstrip">'+cards+'</div>'+
+      '<button class="rd-gmore" onclick="rdToggleGroup('+i+')">'+(exp?'收起':'展开')+'</button></div>'+rest;
+  }).join('')||'<div class="rd-loading">没有符合条件的漫画</div>';
+  rdFillThumbs(grid);
+  document.getElementById('rd-more').textContent=rdItems.length>=60?
+    '只显示前 60 本, 缩小筛选范围可看到更多':''}
+function rdToggleGroup(i){const label=rdGroups()[i].label;
+  if(rdExpanded.has(label))rdExpanded.delete(label);else rdExpanded.add(label);
+  rdRenderGroups()}
+function rdFillThumbs(root){let k=0;
+  const imgs=[...root.querySelectorAll('img[data-name]')];
+  function next(){
+    if(k>=imgs.length)return;
+    const img=imgs[k++];
+    img.src='/api/reader/thumb?'+new URLSearchParams({
+      name:img.dataset.name,size:img.dataset.size,src_dir:rdDir()});
+    img.onerror=()=>{img.style.background='#f8f8f8'};
+    img.onload=next;
+    setTimeout(next,600);
+  }next()}
+function rdRenderView(){const v=rdViewMode();
+  const grid=document.getElementById('rd-grid');
+  if(v==='grid'){grid.classList.add('rd-grid');grid.classList.remove('rd-group-list');
+    rdRenderGrid();return}
+  rdRenderGroups()}
+
+function rdDir(){return document.getElementById('rd-dir').value.trim()}
+function rdSaveFavs(){localStorage.setItem('manga_rd_favs',JSON.stringify(rdFavs))}
+function rdChipKey(f,v){return f+'\u0001'+v}
+function rdRenderFavs(){
+  const box=document.getElementById('rd-favs');
+  box.innerHTML=rdFavs.length?rdFavs.map((f,i)=>{
+    const on=rdSel.some(s=>rdChipKey(s.field,s.value)===rdChipKey(f.field,f.value));
+    const del=rdManageFavs?
+      '<button type="button" class="rd-del" aria-label="删除标签" '+
+      'onclick="rdDelFav(event,'+i+')">×</button>':'';
+    return '<span class="rd-chip fav'+(on?' on':'')+'">'+
+      '<span class="rd-label" onclick="rdToggleFav('+i+')">'+
+      esc(RD_FIELDS[f.field]||f.field)+':'+esc(f.value)+'</span>'+del+'</span>';
+  }).join(''):'<span style="font-size:12px;color:#aaa">输入文字筛选; 回车可收藏成标签</span>';
+}
+function rdToggleFavManage(){
+  rdManageFavs=!rdManageFavs;
+  const b=document.getElementById('rd-manage-btn');
+  if(b)b.textContent=rdManageFavs?'完成':'管理';
+  // 退出管理时复位所有待确认的删除按钮
+  document.querySelectorAll('#rd-favs .rd-del').forEach(b=>{
+    b.dataset.confirm='';b.textContent='×';b.classList.remove('confirm');
+  });
+  clearTimeout(rdDelTimer);rdDelTimer=null;
+  rdRenderFavs();
+}
+function rdDelFav(e,i){
+  e.stopPropagation();
+  const btn=e.currentTarget;
+  if(btn.dataset.confirm!=='1'){
+    // 第一次点: 进入确认状态, 不真删; 同时给其它标签复位
+    document.querySelectorAll('#rd-favs .rd-del').forEach(b=>{
+      b.dataset.confirm='';b.textContent='×';b.classList.remove('confirm');
+    });
+    btn.dataset.confirm='1';btn.textContent='确认删除';btn.classList.add('confirm');
+    clearTimeout(rdDelTimer);
+    rdDelTimer=setTimeout(()=>{
+      if(btn.isConnected){btn.dataset.confirm='';btn.textContent='×';btn.classList.remove('confirm')}
+    },3500);
+    return;
+  }
+  // 第二次点: 真删
+  clearTimeout(rdDelTimer);rdDelTimer=null;
+  const f=rdFavs[i], k=rdChipKey(f.field,f.value);
+  rdSel=rdSel.filter(s=>rdChipKey(s.field,s.value)!==k);
+  rdFavs.splice(i,1);rdSaveFavs();rdRenderFavs();rdLoad();
+}
+function rdToggleFav(i){
+  const f=rdFavs[i], k=rdChipKey(f.field,f.value);
+  const at=rdSel.findIndex(s=>rdChipKey(s.field,s.value)===k);
+  if(at>=0)rdSel.splice(at,1);
+  else rdSel.push({field:f.field,value:f.value,op:'contains'});
+  rdRenderFavs();rdLoad();
+}
+function rdQuickInput(){
+  if(rdQuickTimer)clearTimeout(rdQuickTimer);
+  rdQuickTimer=setTimeout(rdLoad,200);   // 本地条件, 只发筛选请求, 不查词表
+}
+function rdQuickKey(e){
+  if(e.key!=='Enter')return;
+  e.preventDefault();
+  const f=document.getElementById('rd-field').value;
+  const v=document.getElementById('rd-quick').value.trim();
+  if(!v)return;
+  const k=rdChipKey(f,v);
+  if(!rdFavs.some(x=>rdChipKey(x.field,x.value)===k)){
+    rdFavs.push({field:f,value:v});rdSaveFavs();
+  }
+  if(!rdSel.some(s=>rdChipKey(s.field,s.value)===k))
+    rdSel.push({field:f,value:v,op:'contains'});
+  document.getElementById('rd-quick').value='';
+  rdRenderFavs();rdLoad();
+}
+function rdAddCond(){
+  const box=document.getElementById('rd-conds');
+  const id='rdc'+Date.now()+Math.floor(Math.random()*1000);
+  const div=document.createElement('div');div.className='cond';div.id=id;
+  div.innerHTML='<span class="cond-idx"></span>'+
+    '<select class="c-field">'+
+    Object.keys(RD_FIELDS).map(f=>'<option value="'+f+'">'+RD_FIELDS[f]+'</option>').join('')+
+    '</select><select class="c-op">'+
+    '<option value="eq">等于</option><option value="contains">包含</option>'+
+    '<option value="ne">不等于</option><option value="not_contains">不包含</option>'+
+    '<option value="empty">为空</option><option value="not_empty">不为空</option>'+
+    '</select><input type="text" class="c-val" placeholder="值">'+
+    '<button class="del" onclick="document.getElementById(\''+id+'\').remove()">×</button>';
+  box.appendChild(div);
+}
+function rdConditions(){
+  const out=rdSel.map(s=>({field:s.field,op:'contains',value:s.value}));
+  const q=document.getElementById('rd-quick');
+  if(q&&q.value.trim())
+    out.push({field:document.getElementById('rd-field').value,
+              op:'contains',value:q.value.trim()});
+  document.querySelectorAll('#rd-conds .cond').forEach(el=>{
+    const c={field:el.querySelector('.c-field').value,
+      op:el.querySelector('.c-op').value,
+      value:el.querySelector('.c-val').value.trim()};
+    if(c.value||c.op==='empty'||c.op==='not_empty')out.push(c);
+  });
+  return out;
+}
+function rdLoad(){
+  rdOffset=0; rdExpanded.clear();
+  const v=rdViewMode(); const sel=document.getElementById('rd-view');
+  if(sel)sel.value=v;
+  const body={src_dir:rdDir(),conditions:rdConditions(),
+    join:document.getElementById('rd-join').value,
+    scope:'all',limit:60};
+  fetch('/api/reader/list',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(body)}).then(r=>r.json()).then(d=>{
+      if(d.error||!Array.isArray(d.items)){
+        document.getElementById('rd-grid').innerHTML=
+          '<div class="rd-loading">'+esc(d.error||'接口返回格式错误')+'</div>';
+        return;
+      }
+      rdItems=d.items;
+      document.getElementById('rd-count').textContent=
+        d.items.length+' / 共 '+d.total+' 本 (目录里 '+d.in_dir+' 本)';
+      rdRenderView();
+    });
+}
+function rdApplyCols(){
+  const n=parseInt(document.getElementById('rd-cols').value)||2;
+  document.getElementById('rd-grid').style.gridTemplateColumns='repeat('+n+',1fr)';
+}
+function rdRenderGrid(){
+  rdApplyCols();
+  const grid=document.getElementById('rd-grid');
+  grid.innerHTML=rdItems.map((it,i)=>{
+    const sub=it.artist||it.parody||'';
+    return '<div class="rd-card" onclick="rdOpen('+i+')">'+
+      '<img class="rd-thumb" loading="lazy" alt="" data-name="'+esc(it.name)+'" data-size="'+it.size+'">' +
+      '<div class="rd-meta"><div class="rd-name">'+esc(it.title||it.name)+'</div>'+
+      '<div class="rd-sub">'+esc(sub)+'</div></div></div>';
+  }).join('')||'<div class="rd-loading">没有符合条件的漫画</div>';
+  rdFillThumbs(grid);
+  document.getElementById('rd-more').textContent=rdItems.length>=60?
+    '只显示前 60 本, 缩小筛选范围可看到更多':'';
+}
+function rdOpen(i){
+  rdView=rdItems[i];
+  fetch('/api/reader/pages?'+new URLSearchParams({name:rdView.name,src_dir:rdDir()}))
+    .then(r=>r.json()).then(d=>{
+      if(d.error){alert(d.error);return;}
+      rdView.pages=d.pages;rdPageIdx=0;
+      history.pushState({mangaReader:1},'');rdHistoryPushed=true;
+      document.documentElement.classList.add('rd-open');
+      document.body.classList.add('rd-open');
+      document.getElementById('reader-modal').classList.add('show');
+      document.getElementById('rd-view-title').textContent=rdView.title||rdView.name;
+      rdRenderPage();
+    });
+}
+// 翻页模式: 'lr' 左到右(左=上一页), 'rl' 右到左(右=上一页), 'scroll' 上下连续
+const RD_MODES=[['lr','→→'],['rl','←←'],['scroll','↕↕']];
+function rdMode(){return localStorage.getItem('manga_rd_mode')||'lr'}
+function rdCycleMode(){
+  const i=RD_MODES.findIndex(m=>m[0]===rdMode());
+  const m=RD_MODES[(i+1)%RD_MODES.length];
+  localStorage.setItem('manga_rd_mode',m[0]);
+  document.getElementById('rd-mode-btn').textContent=m[1];
+  if(rdView){
+    if(m[0]==='scroll')rdRenderScroll(true);
+    else rdRenderPage();
+  }
+}
+function rdPageUrl(entry){
+  return '/api/reader/page?'+new URLSearchParams({
+    name:rdView.name,src_dir:rdDir(),entry:entry});
+}
+function rdRenderPage(){
+  if(!rdView)return;
+  const stage=document.getElementById('rd-stage');
+  const mode=rdMode();
+  stage.classList.toggle('scroll-mode',false);
+  stage.innerHTML='<img src="'+rdPageUrl(rdView.pages[rdPageIdx])+'">';
+  stage.scrollTop=0;
+  document.getElementById('rd-page-no').textContent=
+    (rdPageIdx+1)+' / '+rdView.pages.length;
+  document.getElementById('rd-mode-btn').textContent=
+    (RD_MODES.find(m=>m[0]===mode)||RD_MODES[0])[1];
+}
+// 连续滚动模式: 一次渲染前后各几页, 滚到接近末尾再追加
+function rdRenderScroll(reset){
+  if(!rdView)return;
+  const stage=document.getElementById('rd-stage');
+  stage.classList.add('scroll-mode');
+  if(reset){
+    stage.innerHTML=rdView.pages.map((p,i)=>
+      '<img data-p="'+i+'"'+(i<8?' src="'+rdPageUrl(p)+'"':'')+'>').join('');
+    rdPageIdx=0;
+    stage.scrollTop=0;
+  }
+  const imgs=stage.querySelectorAll('img');
+  imgs.forEach(img=>{
+    if(img.getAttribute('src'))return;
+    const p=parseInt(img.dataset.p);
+    if(Math.abs(p-rdPageIdx)<=8)img.src=rdPageUrl(rdView.pages[p]);
+  });
+  const at=Math.max(0,Math.min(rdView.pages.length-1,
+    Math.round(stage.scrollTop/(stage.scrollHeight/rdView.pages.length))));
+  rdPageIdx=at;
+  document.getElementById('rd-page-no').textContent=
+    (rdPageIdx+1)+' / '+rdView.pages.length;
+  document.getElementById('rd-mode-btn').textContent='↕↕';
+}
+function rdOnScroll(){
+  if(!rdView||rdMode()!=='scroll')return;
+  const stage=document.getElementById('rd-stage');
+  const at=Math.max(0,Math.min(rdView.pages.length-1,
+    Math.round(stage.scrollTop/(stage.scrollHeight/rdView.pages.length))));
+  rdPageIdx=at;
+  document.getElementById('rd-page-no').textContent=(at+1)+' / '+rdView.pages.length;
+  stage.querySelectorAll('img').forEach(img=>{
+    if(img.getAttribute('src'))return;
+    if(Math.abs(parseInt(img.dataset.p)-at)<=8)img.src=rdPageUrl(rdView.pages[parseInt(img.dataset.p)]);
+  });
+}
+function rdPage(d){
+  if(!rdView)return;
+  if(rdMode()==='scroll'){
+    const stage=document.getElementById('rd-stage');
+    const per=stage.scrollHeight/rdView.pages.length;
+    stage.scrollTop=Math.max(0,Math.min(stage.scrollHeight,
+      stage.scrollTop+d*per));rdOnScroll();return;
+  }
+  const n=rdPageIdx+d;
+  if(n<0||n>=rdView.pages.length)return;
+  rdPageIdx=n;rdRenderPage();
+}
+// 点击左/右半屏翻页; scroll 模式不拦截点击
+function rdStageClick(e){
+  if(rdSwiped){rdSwiped=false;return;}   // 横滑后浏览器还会补一次 click, 别翻两页
+  if(rdMode()==='scroll'||!rdView)return;
+  const rect=document.getElementById('rd-stage').getBoundingClientRect();
+  const left=e.clientX-rect.left<rect.width/2;
+  const back=rdMode()==='lr'?left:!left;
+  rdPage(back?-1:1);
+}
+let rdTouchX=null,rdTouchY=null,rdSwiped=false;
+function rdTouchStart(e){
+  rdTouchX=e.changedTouches[0].clientX;
+  rdTouchY=e.changedTouches[0].clientY;
+}
+function rdTouchEnd(e){
+  if(rdTouchX==null||rdMode()==='scroll')return;
+  const dx=e.changedTouches[0].clientX-rdTouchX;
+  const dy=e.changedTouches[0].clientY-rdTouchY;
+  rdTouchX=rdTouchY=null;
+  if(Math.abs(dx)<40||Math.abs(dx)<Math.abs(dy))return;  // 只认横向滑动
+  rdSwiped=true;
+  // 右滑=上一页 (lr) / 下一页 (rl); 左滑相反
+  const forward=rdMode()==='lr'?(dx<0):(dx>0);
+  rdPage(forward?1:-1);
+}
+function rdDoClose(){
+  document.getElementById('reader-modal').classList.remove('show');
+  document.getElementById('rd-stage').innerHTML='';
+  document.documentElement.classList.remove('rd-open');
+  document.body.classList.remove('rd-open');
+  rdView=null;rdHistoryPushed=false;
+}
+function rdClose(){
+  if(rdHistoryPushed){history.back();return;}
+  rdDoClose();
+}
+window.addEventListener('popstate',()=>{
+  if(document.getElementById('reader-modal').classList.contains('show'))rdDoClose();
+});
+document.addEventListener('keydown',e=>{
+  if(!document.getElementById('reader-modal').classList.contains('show'))return;
+  if(e.key==='ArrowLeft')rdPage(-1);
+  if(e.key==='ArrowRight')rdPage(1);
+  if(e.key==='Escape')rdClose();
+});
 
 // ---- 扫描 ----
 function doScan(){
@@ -796,8 +1597,12 @@ function doScan(){
     .then(r=>r.json()).then(d=>{
       scanId=d.scan_id;
       document.getElementById('scan-log').textContent='';
+      logShown=0;
       document.getElementById('scan-status').textContent='扫描中...';
       document.getElementById('scan-prog').classList.remove('hidden');
+      const pl=document.getElementById('scan-progress-line');
+      pl.style.display='block';
+      pl.textContent='准备中…';
       document.getElementById('btn-stop').disabled=false;
       pollScan();
     });
@@ -805,23 +1610,63 @@ function doScan(){
 function doStop(){
   fetch('/api/scan/stop?id='+scanId).then(r=>r.json());
 }
+
+// 日志只追加新行。原来用 textContent.includes(l) 去重: 既 O(n²),
+// 又会把"两行内容相同"误判成重复而吞掉。改成记住已渲染的行数。
+let logShown=0;
+function appendLog(lines){
+  if(!lines||!lines.length)return;
+  const box=document.getElementById('scan-log');
+  if(logShown>lines.length)logShown=0;      // 换了新任务, 重新来
+  if(logShown<lines.length){
+    box.textContent+=lines.slice(logShown).join('\n')+'\n';
+    logShown=lines.length;
+  }
+  box.scrollTop=box.scrollHeight;
+}
+
+// 进度行: 固定一行, 原地改数字, 不新增行。
+function renderProgress(p,running){
+  const el=document.getElementById('scan-progress-line');
+  if(!el)return;
+  if(!p){el.style.display='none';return;}
+  el.style.display='block';
+  const total=p.total||0, done=p.done||0;
+  const pct=total? Math.min(100,Math.round(done*100/total)) : 0;
+  let s='⏳ '+(p.phase||'处理中');
+  // 拉清单/检查增量这类阶段还不知道总数, 不显示 N/M
+  if(total>0)s+='  '+done+' / '+total+'  ('+pct+'%)';
+  if(p.current)s+='  当前: '+p.current;
+  el.textContent=s;
+  const fill=document.querySelector('#scan-prog .progress-fill');
+  if(fill&&total>0)fill.style.width=pct+'%';
+}
+
 function pollScan(){
   if(pollTimer)clearInterval(pollTimer);
   pollTimer=setInterval(()=>{
     fetch('/api/scan/status?id='+scanId).then(r=>r.json()).then(d=>{
-      if(d.log)d.log.forEach(l=>{
-        if(!document.getElementById('scan-log').textContent.includes(l))
-          document.getElementById('scan-log').textContent+=l+'\n';
-      });
-      document.getElementById('scan-log').scrollTop=999999;
+      appendLog(d.log);
+      renderProgress(d.progress,d.running);
       if(!d.running){
         clearInterval(pollTimer);pollTimer=null;
         document.getElementById('btn-stop').disabled=true;
         document.getElementById('scan-prog').classList.add('hidden');
+        const pl=document.getElementById('scan-progress-line');
+        pl.style.display='none';
         if(d.stats){
           const s=d.stats;
-          document.getElementById('scan-status').textContent=
-            '完成 ✓ 成功'+s.done+' 失败'+s.fail+' 跳过'+s.skip+' 耗时'+(s.elapsed||0).toFixed(0)+'s';
+          const st=document.getElementById('scan-status');
+          if(s.error){
+            // 扫描线程抛异常时 stats 只有 error, 没有 done/fail/skip。
+            // 以前直接拼 s.done 会显示 "成功undefined 失败undefined"。
+            st.textContent='扫描失败: '+s.error;
+            st.style.color='#c62828';
+          }else{
+            st.textContent='完成 ✓ 成功'+s.done+' 失败'+s.fail+
+              ' 跳过'+s.skip+' 耗时'+(s.elapsed||0).toFixed(0)+'s';
+            st.style.color='';
+          }
         }
       }
     });
@@ -848,9 +1693,16 @@ function loadDistinct(){
   const f=document.getElementById('browse-field').value;
   fetch('/api/distinct?'+new URLSearchParams({field:f,scope:browseScope()}))
     .then(r=>r.json()).then(d=>{
+    if(d.error){document.getElementById('browse-value').innerHTML=
+      '<option value="">'+esc(d.error)+'</option>';return;}
     const sel=document.getElementById('browse-value');
     sel.innerHTML='<option value="">(全部)</option>'+
       d.values.map(v=>'<option value="'+esc(v.value)+'">'+esc(v.value)+' ('+v.count+')</option>').join('');
+    // 下拉框只列前 500 个: 说清楚, 免得用户以为库里没有某个值
+    if(d.truncated){
+      sel.innerHTML+='<option value="" disabled>—— 共 '+d.total+
+        ' 个值, 只列出前 '+d.values.length+' 个(用下面的"包含"搜索其余)——</option>';
+    }
   });
 }
 function doQuery(){
@@ -861,7 +1713,10 @@ function doQuery(){
                                            scope:browseScope()}))
     .then(r=>r.json()).then(d=>{
       const tb=document.querySelector('#browse-table tbody');
-      document.getElementById('browse-count').textContent=d.count+' 条';
+      // 截断必须说出来: 只显示 count 的话分不清"就这么多"和"被截断了"
+      document.getElementById('browse-count').textContent=
+        d.truncated ? (d.count+' / 共 '+d.total+' 条(只显示前 '+d.limit+' 条)')
+                    : (d.count+' 条');
       if(d.error){tb.innerHTML='<tr><td colspan=6>'+esc(d.error)+'</td></tr>';return;}
       tb.innerHTML=d.rows.map((r,i)=>{
         const m=cols2obj(d.columns,r);
@@ -962,8 +1817,125 @@ function syncDest(){
   const s=document.getElementById('cls-src').value.trim();
   if(s)document.getElementById('cls-dest').value=s;
   updateDestHint();
+  updateRemoteNote();
 }
 
+// 远程路径识别: `123:/...` 是远程。判定规则与服务端 source.is_remote 一致
+// (排除 C:/ 这种盘符)。
+function isRemotePath(p){
+  if(!p||p.indexOf(':')<0)return false;
+  const i=p.indexOf(':');
+  const head=p.slice(0,i), rest=p.slice(i+1);
+  if(!head||head.indexOf('/')>=0||head.indexOf('\\')>=0)return false;
+  if(rest[0]!=='/')return false;
+  if(head.length===1&&/[A-Za-z]/.test(head))return false;
+  return true;
+}
+function updateRemoteNote(){
+  const src=document.getElementById('cls-src').value.trim();
+  const dst=document.getElementById('cls-dest').value.trim();
+  const el=document.getElementById('cls-remote-note');
+  const copyRadio=document.getElementById('cls-mode-copy');
+  const rs=isRemotePath(src), rd=isRemotePath(dst);
+  if(rs&&rd){
+    el.textContent='远程模式: 仅支持移动, 不支持复制(123 云盘 WebDAV 的 COPY 返回 500)。'+
+      '多值字段只会移动到第一个目标目录, 其余目录会跳过并在日志里列出。';
+    // 远程不能复制: 直接把复制单选禁用, 免得选到一半才发现
+    copyRadio.disabled=true;
+    if(copyRadio.checked)document.querySelector('input[name=mode][value=move]').checked=true;
+  }else if(rs||rd){
+    el.textContent='⚠ 源目录和目标目录必须同为本地或同为远程(跨存储搬运暂不支持)。';
+    copyRadio.disabled=false;
+  }else{
+    el.textContent='';
+    copyRadio.disabled=false;
+  }
+}
+
+// 第三个「按字段建子目录」单向跟随筛选条件的第一条: 二变则三变,
+// 三手动改不影响二。只认第一行 —— 追加第二条不动三; 删掉第一条也不动三
+// (第二条顶上来不算"新加的第一条")。没有条件时保持默认。
+function syncGroupByFromFirstCond(){
+  const first=document.querySelector('#cls-conds .cond');
+  if(!first)return;
+  const f=first.querySelector('.c-field').value;
+  const sel=document.getElementById('cls-groupby');
+  // 标题这类字段没有建目录选项, 保持三原样
+  if([...sel.options].some(o=>o.value===f)){
+    sel.value=f;
+    updateDestHint();
+  }
+}
+// ---- 分类: 条件值历史 (输入框右侧 ▾ 唤起, 最多显示 5 条) ----
+// 数字条件(作品数)和文本条件分开记, 免得 "4" 混进作者名历史里
+const CLS_HIST_KEY='clsValHist', CLS_HIST_MAX=5;
+function clsHist(){
+  try{
+    const a=JSON.parse(localStorage.getItem(CLS_HIST_KEY)||'[]');
+    return Array.isArray(a)?a.filter(e=>e&&typeof e.v==='string'):[];
+  }catch(e){return []}
+}
+function clsHistSave(a){
+  // 每类各留 5 条, 存 10 条, 显示时按当前条件类型筛
+  const out=[];
+  for(const e of a){
+    const k=e.n?1:0;
+    if(out.filter(x=>(x.n?1:0)===k).length<CLS_HIST_MAX)out.push(e);
+  }
+  try{localStorage.setItem(CLS_HIST_KEY,JSON.stringify(out))}catch(e){}
+}
+function clsHistPush(v,isCount){
+  v=(v||'').trim();if(!v)return;
+  const n=isCount?1:0;
+  clsHistSave([{v:v,n:n}].concat(
+    clsHist().filter(e=>!(e.v===v&&(e.n?1:0)===n))));
+}
+// 点浮层以外的地方收起所有历史下拉
+document.addEventListener('click',e=>{
+  if(e.target.closest('.c-val-wrap'))return;
+  document.querySelectorAll('.hist-pop').forEach(p=>p.remove());
+});
+function setupValHistory(wrap){
+  const input=wrap.querySelector('input'), btn=wrap.querySelector('.hist-btn');
+  const isCount=()=>{
+    const op=wrap.closest('.cond').querySelector('.c-op');
+    return op&&op.value.startsWith('count_');
+  };
+  // 回车/失焦时记一条; 失焦延迟一拍, 让浮层里的点击先拿到
+  input.addEventListener('keydown',e=>{if(e.key==='Enter')clsHistPush(input.value,isCount())});
+  input.addEventListener('blur',()=>setTimeout(()=>clsHistPush(input.value,isCount()),150));
+  btn.addEventListener('click',()=>{
+    const had=wrap.querySelector('.hist-pop');
+    document.querySelectorAll('.hist-pop').forEach(p=>p.remove());
+    if(had)return;   // 再点一次收起
+    const cnt=isCount();
+    const vals=clsHist().filter(e=>!!e.n===cnt).map(e=>e.v).slice(0,CLS_HIST_MAX);
+    const pop=document.createElement('div');
+    pop.className='hist-pop';
+    pop.innerHTML=vals.length
+      ? '<div class="hint">最近 '+vals.length+' 条</div>'+vals.map(v=>
+          '<div class="hi"><span class="hi-v">'+esc(v)+'</span>'+
+          '<span class="hi-x" title="删除这条">×</span></div>').join('')
+      : '<div class="hint">还没有历史记录</div>';
+    wrap.appendChild(pop);
+    const items=[...pop.querySelectorAll('.hi')];
+    items.forEach((el,i)=>{
+      const v=vals[i];
+      el.addEventListener('click',ev=>{
+        if(ev.target.classList.contains('hi-x')){
+          clsHistSave(clsHist().filter(e=>e.v!==v));
+          el.remove();
+          if(!pop.querySelector('.hi'))
+            pop.innerHTML='<div class="hint">还没有历史记录</div>';
+          return;
+        }
+        input.value=v;
+        input.dispatchEvent(new Event('input'));  // 手选的值不当自动填的默认
+        pop.remove();input.focus();
+      });
+    });
+  });
+}
 function addCond(field,op,value){
   const id=++condSeq;
   const div=document.createElement('div');
@@ -973,20 +1945,42 @@ function addCond(field,op,value){
       '<option value="'+f[0]+'"'+(f[0]===(field||'artist')?' selected':'')+'>'+f[1]+'</option>').join('')+'</select>'+
     '<select class="c-op">'+CLS_OPS.map(o=>
       '<option value="'+o[0]+'"'+(o[0]===(op||'eq')?' selected':'')+'>'+o[1]+'</option>').join('')+'</select>'+
-    '<input type="text" class="c-val" placeholder="值" value="'+esc(value||'')+'">'+
+    '<span class="c-val-wrap"><input type="text" class="c-val" placeholder="值" '+
+      'value="'+esc(value||'')+'" autocomplete="off">'+
+      '<button type="button" class="hist-btn" title="历史记录">▾</button></span>'+
     '<button class="del" onclick="delCond('+id+')">×</button>';
   document.getElementById('cls-conds').appendChild(div);
   // 操作符切换时更新输入框提示; 数量条件和"为空/不为空"的输入框行为不同
   const opSel=div.querySelector('.c-op'), valIn=div.querySelector('.c-val');
+  let autoVal=false;   // 当前值是不是数量条件自动填的 4
+  valIn.addEventListener('input',()=>{autoVal=false;});
   function syncVal(){
     const o=opSel.value;
-    valIn.placeholder=o.startsWith('count_')?'数字':'值';
+    const isCount=o.startsWith('count_');
+    valIn.placeholder=isCount?'数字':'值';
     valIn.disabled=(o==='empty'||o==='not_empty');
+    if(isCount){
+      // 数量条件默认给 4, 免得空着被当成 0 条作品
+      if(!valIn.value){valIn.value='4';autoVal=true;}
+    }else if(autoVal){
+      // 离开数量条件时, 自动填的 4 清掉, 别让它跟到"等于作者"上
+      valIn.value='';autoVal=false;
+    }
     if(valIn.disabled)valIn.value='';
   }
   opSel.addEventListener('change',syncVal);
   syncVal();
+  setupValHistory(div.querySelector('.c-val-wrap'));
+  // 改的若是第一行字段, 三跟着变; 改第二行及以后不联动
+  div.querySelector('.c-field').addEventListener('change',()=>{
+    if(document.getElementById('cls-conds').firstElementChild===div)
+      syncGroupByFromFirstCond();
+  });
   updateCondIdx();
+  // 只有"新加的这一行就是第一行"才联动(库里原本没条件);
+  // 追加第二行时三保持用户当前选择
+  if(document.getElementById('cls-conds').firstElementChild===div)
+    syncGroupByFromFirstCond();
 }
 function delCond(id){
   const el=document.getElementById('cond-'+id);
@@ -1013,6 +2007,7 @@ function collectConds(){
 // 不预置条件行: 空条件(值没填)会被当成 artist = '' 从而把结果滤成 0 条,
 // 看着就像"什么都没匹配到"。要筛自己点「+ 添加条件」。
 updateDestHint();
+updateRemoteNote();
 
 // ---- 分类: 预览与执行 ----
 function clsPayload(){
@@ -1044,9 +2039,33 @@ function doPreview(){
         d.count+' 个文件将被'+(p.mode=='move'?'移动':'复制')+
         (fanout>d.count?(' ('+fanout+' 份,有文件重复归档)'):'');
       const miss=document.getElementById('cls-missing');
+      let warn=[];
       if(d.missing&&d.missing.length){
-        miss.textContent='⚠ '+d.missing.length+' 个文件在磁盘上找不到,会被跳过';
-      }else{miss.textContent='';}
+        warn.push('⚠ '+d.missing.length+' 个文件在磁盘上找不到,会被跳过');
+      }
+      // 扇出上限丢值: 必须明确提示, 否则用户以为该作品的值都归档了
+      if(d.truncated&&d.truncated.length){
+        warn.push('⚠ '+d.truncated.length+' 个作品的分类值超过单个作品 '+
+          '12 个的上限, 多出的值不会建目录(如: '+
+          esc((d.truncated[0].dropped||[]).slice(0,3).join(', '))+
+          ((d.truncated[0].dropped||[]).length>3?' …':'')+')');
+      }
+      // 不同值清理后同名 -> 会并进同一目录, 必须提示
+      if(d.merged&&d.merged.length){
+        const m0=d.merged[0].merged[0]||[];
+        warn.push('⚠ '+d.merged.length+' 个作品有"清理后同名"的分类值, '+
+          '会被并进同一目录(如: '+esc(String(m0[0]))+' 与 '+
+          esc(String(m0[1]))+')');
+      }
+      // 远程只能移到第一个目录: 扇出的作品必须提前说, 否则预览里
+      // 看着每个目录都有, 实际只搬了第一个
+      if(d.remote){
+        const fan=lastPlan.filter(x=>(x.targets||[]).length>1).length;
+        warn.push('⚠ 远程模式: 仅支持移动, 不支持复制');
+        if(fan)warn.push('其中 '+fan+' 个作品有多个目标目录, '+
+          '实际只会移到第一个, 其余会跳过');
+      }
+      miss.textContent=warn.join(' | ');
       const base=p.base_dir;
       // 文件名不截断: 完整显示, 靠 CSS 换行/横向滚动容纳(截断会让人
       // 以为是文件名本身有问题, 也对不上磁盘上的真实文件)
@@ -1075,6 +2094,12 @@ function hidePreview(){
 function doClassify(){
   const p=clsPayload();
   if(!p.base_dir){alert('请填目标基础目录');return;}
+  if(isRemotePath(p.src_dir)!==isRemotePath(p.base_dir)){
+    alert('源目录与目标目录必须同为本地或同为远程(跨存储搬运暂不支持)');return;
+  }
+  if(isRemotePath(p.src_dir)&&p.mode!=='move'){
+    alert('远程模式只支持移动, 不支持复制');return;
+  }
   // 勾了"先预览"但还没预览过 -> 先预览
   if(document.getElementById('cls-preview').checked&&!previewNames){
     doPreview();return;
@@ -1082,6 +2107,8 @@ function doClassify(){
   if(!lastPlan||!lastPlan.length){
     alert('没有要处理的文件,先预览一下');return;
   }
+  // 执行前把当前各条件的值记进历史 (光填不跑的不算数, 免得历史被试错的乱值占满)
+  p.conditions.forEach(c=>clsHistPush(c.value,c.op.startsWith('count_')));
   const names=lastPlan.map(x=>x.name);
   // 移动是不可逆的: 说明会生成几份,并明确原文件会被删
   let fanout=lastPlan.reduce((s,x)=>s+((x.targets&&x.targets.length)||1),0);
@@ -1143,26 +2170,61 @@ function pollCls(){
 }
 
 // ---- 统计 ----
-let statField=null, statShown=0, statTotal=0, statTimer=null, statsLoaded=false;
+let statField=null, statShown=0, statTotal=0, statTimer=null;
 const STAT_PAGE=20, STAT_STEP=100;
 
 function loadStats(){
-  statsLoaded=true;
-  fetch('/api/stats').then(r=>r.json()).then(d=>{
-    const el=document.getElementById('stats-overview');
-    if(d.error){el.innerHTML='<b>总览</b><p>'+esc(d.error)+'</p>';return;}
-    el.innerHTML='<b>总览</b>'+
+  loadStatScopeHint();
+  fetch('/api/stats?scope='+statScope()).then(r=>r.json()).then(d=>{
+    const el=document.getElementById('stats-summary');
+    if(d.error){el.innerHTML='<p>'+esc(d.error)+'</p>';return;}
+    el.innerHTML=
       '<p>压缩包总数: <b>'+d.total+'</b></p>'+
       '<p>有元数据: <b>'+d.with_meta+'</b> / '+d.total+'</p>'+
       '<p>读取失败: <b>'+d.errors+'</b></p>'+
-      '<p>平均每个作品 <b>'+d.avg_tags+'</b> 个标签</p>'+
-      '<p style="font-size:12px;color:#666;margin-top:6px">点下面按钮切换字段</p>';
+      '<p>平均每个作品 <b>'+d.avg_tags+'</b> 个标签</p>';
     // 字段按钮
     const fe=document.getElementById('stats-fields');
     fe.innerHTML=(d.fields||[]).map(f=>
       '<button class="outline" onclick="pickStatField(\''+f.field+'\')">'+
       esc(FIELD_CN_STAT[f.field]||f.field)+
       ' <span style="font-size:11px;color:#888">'+f.distinct+'</span></button>').join('');
+    // 范围里一个作品都没有: 字段按钮会全空, 得说清楚为什么
+    if(!(d.fields||[]).length){
+      fe.innerHTML=statScope()==='scan'
+        ? '<p style="font-size:12px;color:#888">本次扫描范围里没有带元数据的作品'+
+          '(还没扫描过的话, 先到「扫描」页跑一次)</p>'
+        : '<p style="font-size:12px;color:#888">库里还没有带元数据的作品</p>';
+    }
+    // 范围变了, 已展开的分布属于旧范围 —— 按新范围重拉一遍;
+    // 该字段在新范围里已没有值, 就把明细收起来, 别留个空壳
+    if(statField){
+      if((d.fields||[]).some(f=>f.field===statField))loadStatField(true);
+      else{
+        statField=null;
+        closeStatDrill();
+        document.getElementById('stats-detail-card').style.display='none';
+      }
+    }
+  });
+}
+
+function statScope(){return document.getElementById('stats-scope').value}
+function onStatScopeChange(){
+  closeStatDrill();
+  loadStats();
+}
+function loadStatScopeHint(){
+  fetch('/api/scope').then(r=>r.json()).then(d=>{
+    const el=document.getElementById('stats-scope-hint');
+    if(statScope()==='all'){
+      el.textContent=d.scan_count!=null
+        ? '(全库; 上次扫描到 '+d.scan_count+' 个)' : '(全库)';
+    }else if(d.scan_count==null){
+      el.textContent='(还没扫描过, 先到「扫描」页跑一次)';
+    }else{
+      el.textContent='(上次扫描 '+d.at+' 扫到 '+d.scan_count+' 个)';
+    }
   });
 }
 
@@ -1187,7 +2249,7 @@ function loadStatField(reset){
   const sort=document.getElementById('stats-sort').value;
   const limit=reset?STAT_PAGE:STAT_STEP;
   fetch('/api/stat_field?'+new URLSearchParams({field:statField,limit:limit,
-    offset:statShown,q:q,sort:sort}))
+    offset:statShown,q:q,sort:sort,scope:statScope()}))
     .then(r=>r.json()).then(d=>{
       if(d.error){document.getElementById('stats-bars').innerHTML='<p>'+esc(d.error)+'</p>';return;}
       document.getElementById('stats-detail-title').textContent=
@@ -1218,7 +2280,7 @@ function statLoadAll(){
   const sort=document.getElementById('stats-sort').value;
   if(statTotal>2000&&!confirm('该字段有 '+statTotal+' 个值,全部加载可能很慢。继续?'))return;
   fetch('/api/stat_field?'+new URLSearchParams({field:statField,limit:2000,
-    offset:0,q:q,sort:sort}))
+    offset:0,q:q,sort:sort,scope:statScope()}))
     .then(r=>r.json()).then(d=>{
       if(d.error)return;
       const max=d.top.length?d.top[0].count:1;
@@ -1250,10 +2312,10 @@ function statToBrowse(val){
   document.getElementById('stats-drill-title').textContent=
     (FIELD_CN_STAT[statField]||statField)+' = '+val;
   document.getElementById('stats-drill-body').innerHTML='<p>加载中…</p>';
-  // 统计数字是全库的, 下钻也必须查全库 —— 不传 scope 会默认成"本次扫描",
-  // 扫描范围之外的作品就会显示 0 条, 跟上面那条分布条自相矛盾
+  // 下钻必须跟上面那条分布条用同一个范围: 分布条只算本次扫描到的,
+  // 下钻却查全库的话, 点开来的条数和条上写的数对不上。
   fetch('/api/query?'+new URLSearchParams({field:statField,value:val,
-                                           contains:'',scope:'all'}))
+                                           contains:'',scope:statScope()}))
     .then(r=>r.json()).then(d=>{
       if(d.error){document.getElementById('stats-drill-body').innerHTML='<p>'+esc(d.error)+'</p>';return;}
       const rows=d.rows.map(r=>{
@@ -1265,7 +2327,9 @@ function statToBrowse(val){
           '<td>'+(m.page_count||'')+'</td></tr>';
       }).join('');
       document.getElementById('stats-drill-body').innerHTML=
-        '<div style="font-size:12px;color:#666;margin-bottom:6px">'+d.count+' 个作品</div>'+
+        '<div style="font-size:12px;color:#666;margin-bottom:6px">'+
+        (d.truncated ? d.count+' / 共 '+d.total+' 个作品(只显示前 '+d.limit+' 个)'
+                     : d.count+' 个作品')+'</div>'+
         '<div style="max-height:320px;overflow:auto"><table>'+
         '<thead><tr><th>文件名</th><th>作者</th><th>语言</th><th>页数</th></tr></thead>'+
         '<tbody>'+(rows||'<tr><td colspan=4>无</td></tr>')+'</tbody></table></div>';
@@ -1276,6 +2340,9 @@ function closeStatDrill(){
   statDrill=null;
   document.getElementById('stats-drill').style.display='none';
 }
+
+document.getElementById('rd-stage').addEventListener('scroll',rdOnScroll,{passive:true});
+showPage('read');
 
 // ---- 工具 ----
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
@@ -1313,6 +2380,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _image(self, data, mime, cache=False):
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(data)))
+        if cache:
+            self.send_header("Cache-Control", "public, max-age=86400")
+        else:
+            self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _read_body(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -1372,7 +2450,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(API.classify_stop(cid))
             return
         if path == "/api/stats":
-            self._json(API.stats())
+            scope = qs.get("scope", ["scan"])[0]
+            self._json(API.stats(scope))
             return
         if path == "/api/stat_field":
             field = qs.get("field", [""])[0]
@@ -1384,10 +2463,40 @@ class Handler(BaseHTTPRequestHandler):
                 return
             q = qs.get("q", [""])[0]
             sort = qs.get("sort", ["count"])[0]
-            self._json(API.stat_field(field, limit, offset, q, sort))
+            scope = qs.get("scope", ["scan"])[0]
+            self._json(API.stat_field(field, limit, offset, q, sort, scope))
             return
         if path == "/api/plugins":
             self._json(API.plugins())
+            return
+        if path == "/api/library_candidates":
+            src_dir = qs.get("src_dir", [""])[0]
+            q = qs.get("q", [""])[0]
+            self._json(API.library_candidates(src_dir, q))
+            return
+        if path == "/api/reader/pages":
+            name = qs.get("name", [""])[0]
+            src_dir = qs.get("src_dir", [""])[0]
+            self._json(API.reader_pages(name, src_dir))
+            return
+        if path == "/api/reader/thumb":
+            name = qs.get("name", [""])[0]
+            src_dir = qs.get("src_dir", [""])[0]
+            got = API.reader_thumb(name, qs.get("size", ["0"])[0], src_dir)
+            if not got:
+                self.send_error(404)
+                return
+            self._image(got[0], got[1], cache=True)
+            return
+        if path == "/api/reader/page":
+            name = qs.get("name", [""])[0]
+            src_dir = qs.get("src_dir", [""])[0]
+            entry = qs.get("entry", [""])[0]
+            got = API.reader_page_image(name, src_dir, entry)
+            if not got:
+                self.send_error(404)
+                return
+            self._image(got[0], got[1], cache=False)
             return
         self.send_error(404)
 
@@ -1448,6 +2557,13 @@ class Handler(BaseHTTPRequestHandler):
                                           group_by, src_dir, recursive,
                                           group_dir=group_dir))
             return
+        if path == "/api/reader/list":
+            self._json(API.reader_list(body.get("src_dir", ""),
+                                       body.get("conditions", []),
+                                       body.get("join", "and"),
+                                       body.get("scope", "scan"),
+                                       body.get("limit", 200)))
+            return
         if path == "/api/source":
             src_dir = body.get("src_dir", "")
             recursive = body.get("recursive", False)
@@ -1467,7 +2583,9 @@ def main():
     print(f"数据库: {DB_PATH}")
     print(f"浏览器打开: http://127.0.0.1:{PORT}")
     print(f"Ctrl+C 停止\n")
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+    server = ThreadedHTTPServer(("0.0.0.0", PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -25,7 +25,9 @@ echo "Ctrl+C 停止"
 echo
 
 # 自动杀掉旧的 app.py 进程,避免 address already in use
-old_pids=$(pgrep -f 'python3.*app.py' 2>/dev/null || true)
+# 精确匹配本项目的进程；不能用 'python3.*app.py'，那个 .* 会连
+# "python3 -u webapp.py"(碧蓝档案分类器)一起匹配到，导致互杀
+old_pids=$(pgrep -f 'python3 -u app\.py' 2>/dev/null || true)
 if [ -n "$old_pids" ]; then
     echo "发现旧进程(PID $old_pids),自动清理..."
     kill $old_pids 2>/dev/null
