@@ -30,7 +30,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
-# 数据源层: 本地磁盘与 rclone 远程共用一套接口。source.py 不反向依赖
+# 数据源层: 本地磁盘与 WebDAV 远程共用一套接口。source.py 不反向依赖
 # 本模块, 所以不是循环导入。
 import source as _source
 
@@ -394,7 +394,7 @@ def scan_one(path, size=None, mtime=None, fileobj=None):
 
     path     只用来取文件名(远程时是一个 `123:/a/b.zip` 形式的字符串)。
     size/mtime 给定时直接用 —— 远程文件不落地, 大小和 mtime 只能来自
-              rclone 的目录清单; 不给则按本地文件读(老调用行为不变)。
+              WebDAV 的目录清单; 不给则按本地文件读(老调用行为不变)。
     fileobj  可 seek 的只读文件对象。远程用 RemoteFile, 本地不传。
     """
     if size is None:
@@ -488,6 +488,13 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE INDEX IF NOT EXISTS idx_meta_artist ON meta(artist);
 CREATE INDEX IF NOT EXISTS idx_meta_parody ON meta(parody);
 CREATE INDEX IF NOT EXISTS idx_meta_language ON meta(language);
+CREATE TABLE IF NOT EXISTS reader_zip_index (
+    name          TEXT PRIMARY KEY,
+    size          INTEGER,
+    pages_json    TEXT NOT NULL,
+    created       REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_archives_has_meta ON archives(has_meta);
 
 CREATE TABLE IF NOT EXISTS meta_values (
@@ -523,8 +530,38 @@ def open_db(path=DEFAULT_DB):
     conn.executescript(SCHEMA)
     migrate_drop_path(conn)
     migrate_meta_values(conn)
+    migrate_reader_zip_index(conn)
     conn.commit()
     return conn
+
+
+def migrate_reader_zip_index(conn):
+    """老库迁移: reader_zip_index 改为按文件名唯一, size 只作属性。"""
+    try:
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='reader_zip_index'").fetchone()
+        if not sql or not sql[0]:
+            return False
+        if "PRIMARY KEY (name, size)" not in sql[0] and \
+                "PRIMARY KEY(name, size)" not in sql[0]:
+            return False
+        rows = conn.execute(
+            "SELECT name, MAX(size), MAX(pages_json), MAX(created) "
+            "FROM reader_zip_index GROUP BY name").fetchall()
+        conn.execute("DROP TABLE reader_zip_index")
+        conn.execute("""CREATE TABLE reader_zip_index (
+            name TEXT PRIMARY KEY,
+            size INTEGER,
+            pages_json TEXT NOT NULL,
+            created REAL NOT NULL
+        )""")
+        conn.executemany(
+            "INSERT INTO reader_zip_index (name,size,pages_json,created) "
+            "VALUES (?,?,?,?)", rows)
+        return True
+    except Exception:
+        return False
 
 
 def migrate_drop_path(conn):
@@ -1005,6 +1042,18 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
                     emit(f"  ✗ {name[:70]}: {err}")
             else:
                 save(conn, rec)
+                # 缩略图在扫描阶段补, 阅读页只消费缓存不再触发生成。
+                try:
+                    import reader as _reader
+                    if _reader.thumb_missing(name, it["size"]):
+                        if it["src"] is not None:
+                            _reader.get_thumb(name, it["size"],
+                                              source=it["src"], root=it["path"])
+                        else:
+                            _reader.get_thumb(name, it["size"],
+                                              path=it["path"])
+                except Exception:
+                    pass
                 if not rec["has_meta"]:
                     # 解析成功(能读、没报错)但里面没有元数据文件。
                     # 内容不变就不会再重读 —— 重读结果必然一样。
