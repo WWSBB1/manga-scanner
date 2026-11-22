@@ -56,6 +56,11 @@ CLS_WORKERS = {}    # cls_id -> {running, stop, log[], result}
 # 不用 scanned_at 判断: 增量跳过的记录不会刷新它, 靠它筛不出"本次扫到"。
 LAST_SCAN = {"names": None, "dirs": [], "at": None}
 
+# 阅读页目录清单缓存: key=src_dir, value={name: 完整路径}。
+# 进页面/改筛选只查库, 不重新列目录; 只有点「刷新」才重扫并覆盖。
+READER_DIR_CACHE = {}
+READER_DIR_LOCK = threading.Lock()
+
 
 def fmt_size(n):
     if not n:
@@ -187,82 +192,142 @@ class API:
             return {"error": str(ex)}
 
     @staticmethod
-    def reader_list(src_dir, conditions, join, scope="scan", limit=200):
-        """阅读首页: 按条件筛出作品, 再从源目录定位本地文件。
+    def reader_list(src_dir, conditions, join="and", scope="scan", limit=200,
+                    force=False):
+        """阅读首页: 以目录里的文件为准列出所有可阅读压缩包。
 
-        库里不存路径, 文件在哪只能当场从 src_dir 扫出来。先按目录里的
-        名单收窄 SQL, 免得全库查询后再截断把目标漏掉。
+        数据库只是元数据缓存: 没入库/没元数据的文件照样显示, 只是字段为空。
+        目录列一次就缓存; 只有 force=True(点刷新) 才重新列目录。
         """
         try:
             if not src_dir or not dir_usable(src_dir):
-                return {"error": "请填漫画所在的本地目录"}
-            if src_layer.is_remote(src_dir):
-                return {"error": "阅读器当前只支持本地目录"}
-            found = fileops.match_in_db(DB_PATH, src_dir, False)
-            paths = {i["name"]: i["src"] for i in found}
+                return {"error": "请填有效的漫画目录(本地路径或 WebDAV 远程路径)"}
+            with READER_DIR_LOCK:
+                paths = None if force else READER_DIR_CACHE.get(src_dir)
+                if paths is None:
+                    if force:
+                        try: src_layer.drop_source(src_dir)
+                        except Exception: pass
+                    if src_layer.is_remote(src_dir):
+                        source = src_layer.get_source(src_dir)
+                        paths = {}
+                        for rel, name, size, _mtime in source.list_archives(False):
+                            paths[name] = {"path": source.join(rel), "size": size}
+                    else:
+                        paths = {}
+                        for fn in sorted(os.listdir(src_dir)):
+                            full = os.path.join(src_dir, fn)
+                            if os.path.isfile(full) and \
+                                    os.path.splitext(fn)[1].lower() in scanner.ARCHIVE_EXT:
+                                paths[fn] = {"path": full, "size": os.path.getsize(full)}
+                    READER_DIR_CACHE[src_dir] = paths
+                else:
+                    paths = dict(paths)
             if not paths:
                 return {"items": [], "count": 0, "total": 0,
-                        "hint": "目录里没有已入库的漫画"}
-            # 范围必须下推到 SQL: 先按名字排序取前 limit 本再判断在不在目录里,
-            # 目录只有 195 本而库里有 4 万本时, 前 60 本可能一本都不在目录里。
-            conds = [c for c in (conditions or [])
-                     if (c.get("value") or "").strip()
-                     or c.get("op") in ("empty", "not_empty")]
-            base = API.scope_names(scope)
-            if base is None:
-                scoped = list(paths)
-            else:
-                scoped = [n for n in base if n in paths]
-            where, args = scanner.build_where(conds, join)
+                        "hint": "目录里没有可阅读的漫画压缩包"}
+            # 一次性把库里元数据取出来(按名字), 与文件列表做内存关联
             conn = sqlite3.connect(DB_PATH)
             try:
-                scope_sql = scanner.scope_clause(conn, scoped)
-                total = conn.execute(
-                    "SELECT COUNT(*) FROM archives a "
-                    f"WHERE ({where}) AND ({scope_sql})", args).fetchone()[0]
-                cols = ["id", "name", "size"] + scanner.META_COLUMNS
-                rows = conn.execute(
-                    "SELECT " + ",".join("a." + c if c in ("id", "name", "size")
-                                        else "m." + c for c in cols) +
-                    " FROM archives a LEFT JOIN meta m ON m.archive_id=a.id "
-                    f"WHERE ({where}) AND ({scope_sql}) "
-                    "ORDER BY a.name LIMIT ?", args + [limit]).fetchall()
+                meta_by_name = {}
+                names = list(paths)
+                for i in range(0, len(names), 900):
+                    chunk = names[i:i+900]
+                    ph = ",".join("?" * len(chunk))
+                    cols = ["name"] + scanner.META_COLUMNS
+                    rows = conn.execute(
+                        "SELECT " + ",".join("a." + c if c == "name"
+                                            else "m." + c for c in cols) +
+                        " FROM archives a LEFT JOIN meta m ON m.archive_id=a.id "
+                        f"WHERE a.name IN ({ph})", chunk).fetchall()
+                    for r in rows:
+                        d = dict(zip(cols, r))
+                        # 库里记录的 size 和磁盘文件可能因后补元数据而不同;
+                        # 关联以文件名为准, 不拿 size 当 key。
+                        meta_by_name[r[0]] = d
             finally:
                 conn.close()
             items = []
-            for r in rows:
-                d = dict(zip(cols, r))
-                if d["name"] not in paths:
-                    continue
-                items.append({"name": d["name"], "size": d["size"],
-                              "title": d.get("title") or "",
-                              "artist": d.get("artist") or "",
-                              "parody": d.get("parody") or "",
-                              "tags": d.get("tags") or "",
-                              "character": d.get("character") or "",
-                              "group_name": d.get("group_name") or "",
-                              "category": d.get("category") or "",
-                              "language": d.get("language") or ""})
+            for name in sorted(paths, key=str.lower):
+                info = paths[name]
+                m = meta_by_name.get(name, {})
+                it = {"name": name, "size": info.get("size") or m.get("size") or 0,
+                      "title": m.get("title") or "",
+                      "title_original": m.get("title_original") or "",
+                      "artist": m.get("artist") or "", "parody": m.get("parody") or "",
+                      "tags": m.get("tags") or "", "character": m.get("character") or "",
+                      "group_name": m.get("group_name") or "",
+                      "category": m.get("category") or "",
+                      "language": m.get("language") or "",
+                      "year": m.get("year"), "month": m.get("month"),
+                      "day": m.get("day"), "page_count": m.get("page_count")}
+                items.append(it)
+            # 筛选: 有元数据字段按元数据匹配, 标题额外匹配文件名; 没元数据时只匹配文件名
+            conds = [c for c in (conditions or [])
+                     if (c.get("value") or "").strip()
+                     or c.get("op") in ("empty", "not_empty")]
+            if conds:
+                def match(it, c):
+                    f, op, v = c.get("field"), c.get("op"), str(c.get("value") or "")
+                    vals = [str(it.get(f) or "")]
+                    if f == "title": vals += [str(it.get("title_original") or ""), it["name"]]
+                    hit = any(v.lower() in x.lower() for x in vals if x)
+                    if op == "contains": return hit
+                    if op == "not_contains": return not hit
+                    if op == "eq": return any(v.lower() == x.lower() for x in vals if x)
+                    if op == "ne": return not any(v.lower() == x.lower() for x in vals if x)
+                    if op == "empty": return not any(vals)
+                    if op == "not_empty": return any(vals)
+                    return True
+                items = [it for it in items if (
+                    all(match(it,c) for c in conds) if join == "and"
+                    else any(match(it,c) for c in conds))]
+            total = len(items)
+            items = items[:limit]
             return {"items": items, "count": len(items), "total": total,
                     "in_dir": len(paths), "limit": limit}
         except Exception as ex:
             return {"error": str(ex)}
 
     @staticmethod
-    def reader_pages(name, src_dir):
+    def reader_pages(name, src_dir, size=0):
         try:
-            if not src_dir or src_layer.is_remote(src_dir):
-                return {"error": "只支持本地目录"}
-            if not os.path.isdir(src_dir):
-                return {"error": "目录不存在"}
-            path = os.path.join(src_dir, name)
-            # 只允许源目录这一层的文件名, 不接受带斜杠/..的路径
-            if os.path.dirname(name) or name in (".", "..") \
-                    or not os.path.isfile(path):
+            if not src_dir or not name or os.path.dirname(name) \
+                    or name in (".", ".."):
+                return {"error": "参数错误"}
+            # 优先用扫描时存的页索引: 打开漫画不打开 zip、不下载目录。
+            indexed = None
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                row = conn.execute(
+                    "SELECT pages_json FROM reader_zip_index WHERE name=?",
+                    (name,)).fetchone()
+                conn.close()
+                if row and row[0]:
+                    indexed = [p["p"] for p in json.loads(row[0])]
+            except Exception:
+                indexed = None
+            if indexed:
+                return {"name": name, "pages": indexed, "count": len(indexed)}
+            # 没有索引: 打开漫画时按需解析, 成功后存库, 下次直接命中
+            source = src_layer.get_source(src_dir)
+            fp = reader.open_manga(source, name, size=size, root=src_dir)
+            if not fp:
                 return {"error": "找不到这个文件"}
-            pages = reader.list_pages(path)
+            pages = reader._list_pages_fp(fp)
             if not pages:
                 return {"error": "不是可阅读的 zip, 或里面没有图片"}
+            try:
+                full = reader.zip_entries(fp)
+                conn = sqlite3.connect(DB_PATH)
+                conn.execute("""INSERT INTO reader_zip_index (name,size,pages_json,created)
+                    VALUES (?,?,?,?) ON CONFLICT(name) DO UPDATE SET
+                    size=excluded.size, pages_json=excluded.pages_json,
+                    created=excluded.created""",
+                    (name, int(size or 0), json.dumps(full, ensure_ascii=False), time.time()))
+                conn.commit(); conn.close()
+            except Exception:
+                pass
             return {"name": name, "pages": pages, "count": len(pages)}
         except Exception as ex:
             return {"error": str(ex)}
@@ -286,26 +351,33 @@ class API:
 
     @staticmethod
     def reader_thumb(name, size, src_dir):
-        if not src_dir or src_layer.is_remote(src_dir):
+        if not src_dir:
             return None
         try:
             size = int(size)
         except (TypeError, ValueError):
             return None
-        path = os.path.join(src_dir, name)
-        if os.path.dirname(name) or name in (".", "..") \
-                or not os.path.isfile(path):
+        # 只接受文件名, 不接受带斜杠/..的路径
+        if not name or os.path.dirname(name) or name in (".", ".."):
             return None
-        return reader.get_thumb(name, size, path)
+        # 缓存命中: reader.get_thumb 直接查本地缓存, 不碰数据源;
+        # 未命中才让数据源(本地/WebDAV)读 zip 第一张图。
+        try:
+            source = src_layer.get_source(src_dir)
+        except Exception:
+            return None
+        return reader.get_thumb(name, size, source=source, root=src_dir)
 
     @staticmethod
-    def reader_page_image(name, src_dir, entry):
-        if not src_dir or src_layer.is_remote(src_dir) or os.path.dirname(name):
+    def reader_page_image(name, src_dir, entry, size=0):
+        if not src_dir or not name or os.path.dirname(name) or name in (".", ".."):
             return None
-        path = os.path.join(src_dir, name)
-        if not os.path.isfile(path):
+        try:
+            source = src_layer.get_source(src_dir)
+            fp = reader.open_manga(source, name, size=size, root=src_dir)
+            return reader.get_page_fp(fp, entry)
+        except Exception:
             return None
-        return reader.get_page(path, entry)
 
     @staticmethod
     def _count_values(field, names):
@@ -430,11 +502,11 @@ class API:
                                  "要知道文件在哪才能算出目标"}
             if not dir_usable(src_dir):
                 return {"error": f"源目录不存在: {src_dir}"}
-            # 目标与源必须在同一存储上(都本地, 或同一个 rclone remote)。
+            # 目标与源必须在同一存储上(都本地, 或同一个 WebDAV remote)。
             # 跨存储只能是下载再上传, 本次不做 —— 与其悄悄变慢, 不如直说。
             if not src_layer.same_store(src_dir, base_dir):
                 return {"error": "源目录与目标目录必须在同一存储上 "
-                                 "(都为本地, 或同一个 rclone remote); "
+                                 "(都为本地, 或同一个 WebDAV remote); "
                                  "跨存储搬运需要下载再上传, 暂不支持"}
             # 先拿到源目录里都有哪些文件, 再让查询**在 SQL 层**按这个
             # 名单收窄。顺序不能反: 查询有 limit(按 name 排序取前 N),
@@ -540,11 +612,11 @@ class API:
                 if not dir_usable(src_dir):
                     w["result"] = {"error": f"源目录不存在: {src_dir}"}
                     return
-                # 目标与源必须同一存储(都本地, 或同一个 rclone remote)
+                # 目标与源必须同一存储(都本地, 或同一个 WebDAV remote)
                 if not src_layer.same_store(src_dir, dest):
                     w["result"] = {
                         "error": "源目录与目标目录必须在同一存储上 "
-                                 "(都为本地, 或同一个 rclone remote); "
+                                 "(都为本地, 或同一个 WebDAV remote); "
                                  "跨存储搬运需要下载再上传, 暂不支持"}
                     return
                 remote = src_layer.is_remote(src_dir)
@@ -814,6 +886,12 @@ checkbox-row{display:block;margin:4px 0}
 .hist-pop .hi:hover{background:#e3f2fd}
 .hist-pop .hi .hi-x{float:right;color:#bbb;margin-left:8px}
 .hist-pop .hi .hi-x:hover{color:#ef5350}
+.rd-hist-pop{position:absolute;z-index:160;left:12px;right:12px;margin-top:2px;
+  background:#fff;border:1px solid #ddd;border-radius:6px;max-height:240px;
+  overflow-y:auto;box-shadow:0 4px 12px rgba(0,0,0,.15);padding:4px 0}
+.rd-hist-pop .rd-hi{font-size:13px;padding:8px 10px;cursor:pointer;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border-bottom:1px solid #f5f5f5}
+.rd-hist-pop .rd-hi:active{background:#e3f2fd}
 .dest-path{font-size:11px;color:#2e7d32;word-break:break-all}
 /* 文件名完整显示不截断, 长名字靠换行容纳 */
 #cls-table td:first-child{word-break:break-all}
@@ -822,11 +900,27 @@ checkbox-row{display:block;margin:4px 0}
 .vlist{margin-top:4px;line-height:1.8}
 .vlist .tag{font-size:11px}
 
+/* 右上角设置悬浮窗 */
+#settings-fab{width:34px;height:34px;flex:0 0 34px;
+  border-radius:50%;border:1px solid #ddd;background:#fff;color:#555;
+  font-size:18px;line-height:32px;text-align:center;cursor:pointer}
+#settings-modal{position:fixed;inset:0;background:rgba(0,0,0,.45);
+  z-index:310;display:none;align-items:center;justify-content:center}
+#settings-modal.show{display:flex}
+#settings-modal>.card{width:88%;max-width:420px;background:#fff;border-radius:8px;
+  padding:16px;max-height:80vh;overflow-y:auto}
+
 /* 详情弹窗: 默认隐藏(#detail-modal 没有 .show 时不显示) */
 #detail-modal{position:fixed;inset:0;background:rgba(0,0,0,.5);
   z-index:200;display:none;align-items:center;justify-content:center}
 #detail-modal.show{display:flex}
 #detail-modal>.card{width:90%;max-width:500px;max-height:80vh;overflow-y:auto}
+.md-chip{display:inline-block;padding:4px 9px;margin:2px;border-radius:14px;
+  border:1px solid #ddd;background:#fff;color:#555;font-size:12px;cursor:pointer;
+  -webkit-tap-highlight-color:transparent}
+.md-chip.on{background:#1976d2;color:#fff;border-color:#1976d2}
+.md-group{margin:6px 0 10px;border-bottom:1px solid #f0f0f0;padding-bottom:8px}
+.md-group b{font-size:12px;color:#888;display:block;margin-bottom:4px}
 
 /* 阅读首页 */
 .rd-fav{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
@@ -852,10 +946,16 @@ checkbox-row{display:block;margin:4px 0}
   cursor:pointer}
 .rd-thumb{width:100%;aspect-ratio:3/4;background:#eee;object-fit:cover;display:block}
 .rd-meta{padding:3px 5px;background:#fff}
+.rd-meta-btn{cursor:pointer}
+.rd-meta-btn:active{background:#e3f2fd}
 .rd-name{font-size:12px;line-height:1.35;word-break:break-all;
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .rd-sub{font-size:11px;color:#888;margin-top:2px;white-space:nowrap;
   overflow:hidden;text-overflow:ellipsis}
+.rd-meta-row{display:flex;justify-content:space-between;gap:6px;font-size:11px;
+  color:#888;margin-top:2px;white-space:nowrap;overflow:hidden}
+.rd-meta-row span{overflow:hidden;text-overflow:ellipsis}
+.rd-meta-row .rd-date{flex:0 0 auto;color:#aaa}
 .rd-loading{font-size:12px;color:#999;text-align:center;padding:12px}
 /* 分组视图: 左侧竖排组名, 右侧横滑缩略图 */
 .rd-grow{display:flex;align-items:stretch;border-bottom:1px solid #ddd;min-height:148px}
@@ -896,16 +996,42 @@ body.rd-open .nav{display:none}
 </head>
 <body>
 
+<div id="settings-modal" onclick="if(event.target===this)toggleSettings()">
+  <div class="card">
+    <div class="row" style="justify-content:space-between;margin-bottom:10px">
+      <b>设置</b><button class="outline" onclick="toggleSettings()">关闭</button>
+    </div>
+    <div style="font-size:13px;line-height:2">
+      <div><b>远程漫画缓存</b></div>
+      <div>缓存上限(MB):
+        <input type="number" id="rd-cache-max" min="50" max="5000" step="50"
+               style="width:90px;padding:5px" value="500">
+      </div>
+      <div id="rd-cache-stats" style="color:#666;font-size:12px"></div>
+      <div class="row" style="gap:8px;margin-top:8px">
+        <button class="outline" onclick="rdSaveCacheMax()">保存上限</button>
+        <button class="outline" onclick="rdClearCache()">清空缓存</button>
+      </div>
+      <p style="font-size:12px;color:#888">缓存远程漫画整包；超出上限时自动清理最久未打开的。</p>
+    </div>
+  </div>
+</div>
+
 <div class="content" id="app">
 
 <!-- ===== 阅读首页 ===== -->
 <div id="page-read" class="page">
-<h2>📖 阅读</h2>
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+  <h2 style="margin:0">📖 阅读</h2>
+  <button id="settings-fab" onclick="toggleSettings()" title="设置">⚙</button>
+</div>
 <div class="card">
   <div class="row">
     <input type="text" id="rd-dir" value="/storage/emulated/0/Download">
-    <button class="outline" onclick="rdLoad()">刷新</button>
+    <button class="outline" onclick="rdRefresh()">刷新</button>
+    <button class="outline" onclick="dirHistToggle('rd')" style="flex:0 0 auto;padding:6px 8px">历史</button>
   </div>
+  <div id="rd-dir-hist-box" class="rd-hist-pop" style="display:none"></div>
   <div class="row">
     <label style="font-size:13px">每行
       <select id="rd-cols" onchange="rdApplyCols()" style="padding:4px">
@@ -926,19 +1052,30 @@ body.rd-open .nav{display:none}
         <option value="language">按语言</option>
       </select>
     </label>
+    <label style="font-size:13px">排序
+      <select id="rd-sort" onchange="rdChangeSort()" style="padding:4px">
+        <option value="date">上传时间</option>
+        <option value="name">名称</option>
+        <option value="pages">页数</option>
+      </select>
+      <select id="rd-order" onchange="rdChangeSort()" style="padding:4px">
+        <option value="desc">降序</option>
+        <option value="asc">升序</option>
+      </select>
+    </label>
     <span id="rd-count" style="font-size:12px;color:#666"></span>
   </div>
 </div>
 <div class="card">
   <div class="row" style="justify-content:space-between;margin-bottom:4px">
     <b>筛选</b>
-    <select id="rd-join" style="font-size:13px;padding:5px">
+    <select id="rd-join" onchange="rdSaveOpts()" style="font-size:13px;padding:5px">
       <option value="and">满足全部</option>
       <option value="or">满足任一</option>
     </select>
   </div>
   <div class="row rd-filter-row" style="margin:0;gap:4px">
-    <select id="rd-field" style="flex:0 0 52px;min-width:52px;font-size:13px;padding:6px 0;
+    <select id="rd-field" onchange="rdSaveOpts()" style="flex:0 0 52px;min-width:52px;font-size:13px;padding:6px 0;
       text-align:center;text-align-last:center;-webkit-appearance:none;appearance:none">
       <option value="tags">标签</option>
       <option value="artist">作者</option>
@@ -969,7 +1106,11 @@ body.rd-open .nav{display:none}
 <h2>📦 扫描漫画</h2>
 <div class="card">
   <label>扫描目录 (逗号分隔多个)</label>
-  <input type="text" id="scan-dir" value="/storage/emulated/0/Download">
+  <div class="row">
+    <input type="text" id="scan-dir" value="/storage/emulated/0/Download" oninput="syncDirFromScan()">
+    <button class="outline" onclick="dirHistToggle('scan')" style="flex:0 0 auto;padding:6px 8px">历史</button>
+  </div>
+  <div id="scan-dir-hist-box" class="rd-hist-pop" style="display:none"></div>
   <label style="display:block;margin-top:8px">数据库文件</label>
   <input type="text" id="scan-db" value="__DB_PATH__">
   <div class="row" style="margin-top:8px">
@@ -980,7 +1121,7 @@ body.rd-open .nav{display:none}
   </div>
   <div style="font-size:12px;color:#666;margin-top:6px">
     不勾「扫描子目录」时只看这一层, 子目录里的文件不会被扫到。
-    <br>也可以填 rclone 远程路径, 例如 <code>123:/本图/本子zip</code>
+    <br>也可以填 WebDAV 远程路径, 例如 <code>123:/本图/本子zip</code>
     (本地和远程不能混在同一次扫描里, 请分开扫)。
   </div>
   <div class="progress hidden" id="scan-prog"><div class="progress-fill" style="width:0"></div></div>
@@ -1184,6 +1325,10 @@ body.rd-open .nav{display:none}
       <button class="outline" onclick="closeDetail()">关闭</button>
     </div>
     <div id="detail-content" style="margin-top:8px"></div>
+    <div class="row" style="justify-content:flex-end;margin-top:10px">
+      <button class="outline" onclick="closeDetail()">关闭</button>
+      <button class="outline" onclick="mdApply()" style="background:#1976d2;color:#fff">应用筛选</button>
+    </div>
   </div>
 </div>
 
@@ -1226,19 +1371,63 @@ function showPage(p){
   document.getElementById('nav-'+p).classList.add('active');
   // 统计页每次进来都重新拉: 默认范围是"本次扫描到的", 刚扫完就切过来
   // 必须看到这次的新数字, 缓存住会一直显示上一次的
+  if(p==='scan'){
+    restoreScan();
+    const v=localStorage.getItem('manga_scan_dir');
+    const el=document.getElementById('scan-dir');
+    if(v!==null&&el)el.value=v;
+  }
   if(p==='stats')loadStats();
   // 浏览页同理: 进来就按当前范围(默认"本次扫描到的")显示
   if(p==='browse'){loadScopeHint();loadDistinct();doQuery();}
-  if(p==='read'){rdRenderFavs();rdLoad();}
+  if(p==='read'){rdRestoreOpts();rdRenderFavs();dirHistRender('rd');rdLoad();}
 }
+
+function toggleSettings(){const m=document.getElementById('settings-modal');
+  if(!m)return;
+  const show=!m.classList.contains('show');
+  m.classList.toggle('show',show);
+  if(show){
+    try{const v=localStorage.getItem('manga_cache_max_mb');
+      if(v)document.getElementById('rd-cache-max').value=v;}catch(e){}
+    rdLoadCacheStats();
+  }
+}
+// ---- 阅读缓存设置 ----
+function rdCacheMax(){const v=parseInt(document.getElementById('rd-cache-max')?.value)||500;return v}
+function rdSaveCacheMax(){try{localStorage.setItem('manga_cache_max_mb',String(rdCacheMax()))}catch(e){}
+  rdLoadCacheStats();}
+function rdClearCache(){fetch('/api/cache/clear',{method:'POST'}).then(r=>r.json()).then(d=>{
+  if(d.ok){rdLoadCacheStats();alert('缓存已清空')}})}
+function rdLoadCacheStats(){fetch('/api/cache/stats?max_mb='+rdCacheMax()).then(r=>r.json()).then(d=>{
+  const el=document.getElementById('rd-cache-stats');if(!el)return;
+  if(d.error){el.textContent=d.error;return}
+  el.textContent='已缓存 '+d.count+' 本 / '+(d.bytes/1048576).toFixed(1)+' MB';})}
 
 // ---- 阅读 ----
 const RD_FIELDS={tags:'标签',artist:'作者',group_name:'社团',parody:'原作',
   character:'角色',category:'分类',language:'语言',title:'标题'};
 let rdFavs=JSON.parse(localStorage.getItem('manga_rd_favs')||'[]');
 let rdSel=[], rdItems=[], rdView=null, rdPageIdx=0, rdQuickTimer=null, rdHistoryPushed=false, rdDelTimer=null, rdManageFavs=false;
-let rdExpanded=new Set(), rdListPage=0, rdDirTotal=0;
+let rdExpanded=new Set(), rdListPage=0, rdDirTotal=0, rdPageReq=0;
 const RD_PAGE_SIZE=30;
+function rdSortMode(){const el=document.getElementById('rd-sort');
+  const v=el?el.value:(localStorage.getItem('manga_rd_sort')||'date');
+  return ['name','date','pages'].includes(v)?v:'date'}
+function rdOrder(){const el=document.getElementById('rd-order');
+  const v=el?el.value:(localStorage.getItem('manga_rd_order')||'desc');
+  return v==='asc'?'asc':'desc'}
+function rdChangeSort(){localStorage.setItem('manga_rd_sort',rdSortMode());
+  localStorage.setItem('manga_rd_order',rdOrder());
+  rdListPage=0;rdExpanded.clear();rdSortItems();rdRenderView()}
+function rdItemCmp(a,b){const mode=rdSortMode(), sign=rdOrder()==='asc'?1:-1;
+  const dateKey=it=>{const y=Number(it.year)||0,m=Number(it.month)||0,d=Number(it.day)||0;
+    return y*10000+m*100+d};
+  if(mode==='date')return sign*(dateKey(a)-dateKey(b))||rdNatural(a.name,b.name);
+  if(mode==='pages')return sign*((Number(a.page_count)||0)-(Number(b.page_count)||0))||
+    rdNatural(a.name,b.name);
+  return sign*rdNatural(a.name,b.name)}
+function rdSortItems(){rdItems.sort(rdItemCmp)}
 function rdViewMode(){const v=localStorage.getItem('manga_rd_view')||'grid';
   return document.getElementById('rd-view')&&v!=='grid'?v:'grid'}
 function rdChangeView(){const v=document.getElementById('rd-view').value;
@@ -1263,7 +1452,7 @@ function rdGroups(){const field=rdViewMode();const map={};
   // 按每组作品数降序; 数量相同按名称自然序, 未分类永远最后
   return Object.keys(map).sort((a,b)=>
     a==='未分类'?1:b==='未分类'?-1:map[b].length-map[a].length||rdNatural(a,b))
-    .map(label=>({label,items:map[label].sort((a,b)=>rdNatural(a.name,b.name))}))}
+    .map(label=>({label,items:map[label].sort(rdItemCmp)}))}
 function rdRenderGroups(){const grid=document.getElementById('rd-grid');
   // 分组模式: 一组一行, 不受"每行 2/3/4 本"影响
   grid.classList.remove('rd-grid');grid.style.gridTemplateColumns='';
@@ -1278,13 +1467,14 @@ function rdRenderGroups(){const grid=document.getElementById('rd-grid');
       const idx=rdItems.indexOf(it);
       return '<div class="rd-gcard" onclick="rdOpen('+idx+')">'+
         '<img alt="" data-name="'+esc(it.name)+'" data-size="'+it.size+'">'+
-        '<div class="rd-gname">'+esc(it.title||it.name)+'</div></div>';
+        '<div class="rd-gname">'+esc(it.title_original||it.title||it.name)+'</div></div>';
     }).join('');
     const rest=exp?'<div class="rd-gexpand">'+g.items.map(it=>{
       const idx=rdItems.indexOf(it);
-      return '<div class="rd-card" onclick="rdOpen('+idx+')">'+
-        '<img class="rd-thumb" alt="" data-name="'+esc(it.name)+'" data-size="'+it.size+'">'+
-        '<div class="rd-meta"><div class="rd-name">'+esc(it.title||it.name)+'</div></div></div>';
+      return '<div class="rd-card">'+
+        '<img class="rd-thumb" style="cursor:pointer" onclick="rdOpen('+idx+')" alt="" data-name="'+esc(it.name)+'" data-size="'+it.size+'">'+
+        '<div class="rd-meta rd-meta-btn" onclick="rdShowDetail('+idx+')">'+
+        '<div class="rd-name">'+esc(it.title_original||it.title||it.name)+'</div></div></div>';
     }).join('')+'</div>':'';
     return '<div class="rd-grow"><div class="rd-glabel" title="'+esc(g.label)+'">'+esc(g.label)+'('+g.items.length+')</div>'+
       '<div class="rd-gstrip">'+cards+'</div>'+
@@ -1314,6 +1504,64 @@ function rdRenderView(){const v=rdViewMode();
   rdRenderGroups()}
 
 function rdDir(){return document.getElementById('rd-dir').value.trim()}
+function scanDir(){return document.getElementById('scan-dir').value.trim()}
+const DIR_KEY='manga_rd_dir';
+function syncDirFromRead(){try{localStorage.setItem(DIR_KEY,rdDir());localStorage.setItem('manga_scan_dir',rdDir())}catch(e){}
+  const el=document.getElementById('scan-dir');if(el&&el.value!==rdDir())el.value=rdDir()}
+function syncDirFromScan(){try{localStorage.setItem('manga_scan_dir',scanDir());localStorage.setItem(DIR_KEY,scanDir())}catch(e){}
+  const el=document.getElementById('rd-dir');if(el&&el.value!==scanDir())el.value=scanDir()}
+function rdSaveOpts(){
+  try{
+    localStorage.setItem('manga_rd_join',document.getElementById('rd-join').value);
+    localStorage.setItem('manga_rd_field',document.getElementById('rd-field').value);
+  }catch(e){}
+  syncDirFromRead();
+}
+function rdRestoreOpts(){
+  const set=(id,key,def)=>{const el=document.getElementById(id);if(!el)return;
+    const v=localStorage.getItem(key);if(v!==null)el.value=v;else if(def!==undefined)el.value=def};
+  set('rd-cols','manga_rd_cols','2');
+  set('rd-join','manga_rd_join','and');
+  set('rd-field','manga_rd_field','tags');
+  {
+    // 两页路径修改时互相同步; 但刷新时各自恢复自己上次的值,
+    // 不用共享值互相覆盖, 否则在扫描页扫完别的目录后刷新阅读页会换目录。
+    const v=localStorage.getItem('manga_rd_dir');
+    if(v!==null){const r=document.getElementById('rd-dir');if(r)r.value=v;}
+  }
+  set('rd-view','manga_rd_view','grid');
+  set('rd-sort','manga_rd_sort','date');
+  set('rd-order','manga_rd_order','desc');
+  rdApplyCols();
+}
+const RD_DIR_HIST_KEY='manga_rd_dirs', RD_DIR_HIST_MAX=10;
+function rdDirHist(){
+  try{const a=JSON.parse(localStorage.getItem(RD_DIR_HIST_KEY)||'[]');
+    return Array.isArray(a)?a.filter(x=>typeof x==='string'&&x.trim()):[];
+  }catch(e){return []}
+}
+function rdDirHistPush(v){v=(v||'').trim();if(!v)return;
+  const out=[v].concat(rdDirHist().filter(x=>x!==v)).slice(0,RD_DIR_HIST_MAX);
+  try{localStorage.setItem(RD_DIR_HIST_KEY,JSON.stringify(out))}catch(e){}
+}
+function dirHistRender(which){const box=document.getElementById(which+'-dir-hist-box');
+  if(!box)return;
+  const h=rdDirHist();
+  box.innerHTML=h.length?h.map(v=>
+    '<div class="rd-hi" onclick="dirHistPick(\''+encodeURIComponent(v)+'\')">'+esc(v)+'</div>').join(''):
+    '<div class="rd-hi" style="color:#999">暂无历史, 刷新或扫描后会记住当前路径</div>'}
+function dirHistToggle(which){const box=document.getElementById(which+'-dir-hist-box');
+  if(!box)return;
+  if(box.style.display==='none'){dirHistRender(which);box.style.display='block'}
+  else box.style.display='none'}
+function dirHistPick(enc){const v=decodeURIComponent(enc);
+  document.getElementById('rd-dir').value=v;
+  document.getElementById('scan-dir').value=v;
+  try{localStorage.setItem(DIR_KEY,v);localStorage.setItem('manga_scan_dir',v)}catch(e){}
+  document.querySelectorAll('.rd-hist-pop').forEach(e=>e.style.display='none');
+  if(!document.getElementById('page-read').classList.contains('hidden'))rdLoad();
+}
+function rdRefresh(){rdSaveOpts();rdDirHistPush(rdDir());rdLoad(true)}
 function rdSaveFavs(){localStorage.setItem('manga_rd_favs',JSON.stringify(rdFavs))}
 function rdChipKey(f,v){return f+'\u0001'+v}
 function rdRenderFavs(){
@@ -1386,21 +1634,29 @@ function rdQuickKey(e){
   document.getElementById('rd-quick').value='';
   rdRenderFavs();rdLoad();
 }
-function rdAddCond(){
+function rdRemoveCond(id){const el=document.getElementById(id);if(el)el.remove();rdLoad()}
+let rdCondTimer=null;
+function rdCondInput(){if(rdCondTimer)clearTimeout(rdCondTimer);rdCondTimer=setTimeout(rdLoad,250)}
+function rdAddCondRow(field,op,value){
   const box=document.getElementById('rd-conds');
-  const id='rdc'+Date.now()+Math.floor(Math.random()*1000);
+  const id='rdc'+Date.now()+Math.floor(Math.random()*100000);
   const div=document.createElement('div');div.className='cond';div.id=id;
   div.innerHTML='<span class="cond-idx"></span>'+
-    '<select class="c-field">'+
+    '<select class="c-field" onchange="rdLoad()">'+
     Object.keys(RD_FIELDS).map(f=>'<option value="'+f+'">'+RD_FIELDS[f]+'</option>').join('')+
-    '</select><select class="c-op">'+
+    '</select><select class="c-op" onchange="rdLoad()">'+
     '<option value="eq">等于</option><option value="contains">包含</option>'+
     '<option value="ne">不等于</option><option value="not_contains">不包含</option>'+
     '<option value="empty">为空</option><option value="not_empty">不为空</option>'+
-    '</select><input type="text" class="c-val" placeholder="值">'+
-    '<button class="del" onclick="document.getElementById(\''+id+'\').remove()">×</button>';
+    '</select><input type="text" class="c-val" placeholder="值" oninput="rdCondInput()">'+
+    '<button class="del" onclick="rdRemoveCond(\''+id+'\')">×</button>';
   box.appendChild(div);
+  if(field)div.querySelector('.c-field').value=field;
+  if(op)div.querySelector('.c-op').value=op;
+  if(value)div.querySelector('.c-val').value=value;
+  return div;
 }
+function rdAddCond(){rdAddCondRow()}
 function rdConditions(){
   const out=rdSel.map(s=>({field:s.field,op:'contains',value:s.value}));
   const q=document.getElementById('rd-quick');
@@ -1415,13 +1671,17 @@ function rdConditions(){
   });
   return out;
 }
-function rdLoad(){
+function rdLoad(force){
   rdListPage=0; rdExpanded.clear();
   const v=rdViewMode(); const sel=document.getElementById('rd-view');
   if(sel)sel.value=v;
+  const sortSel=document.getElementById('rd-sort');
+  if(sortSel)sortSel.value=rdSortMode();
+  const orderSel=document.getElementById('rd-order');
+  if(orderSel)orderSel.value=rdOrder();
   const body={src_dir:rdDir(),conditions:rdConditions(),
     join:document.getElementById('rd-join').value,
-    scope:'all',limit:100000};
+    scope:'all',limit:100000,force:!!force};
   fetch('/api/reader/list',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(body)}).then(r=>r.json()).then(d=>{
       if(d.error||!Array.isArray(d.items)){
@@ -1430,6 +1690,7 @@ function rdLoad(){
         return;
       }
       rdItems=d.items; rdDirTotal=d.in_dir||0;
+      rdSortItems();
       document.getElementById('rd-count').textContent=
         d.items.length+' / 共 '+d.total+' 本 (目录里 '+d.in_dir+' 本)';
       rdRenderView();
@@ -1437,6 +1698,7 @@ function rdLoad(){
 }
 function rdApplyCols(){
   const n=parseInt(document.getElementById('rd-cols').value)||2;
+  try{localStorage.setItem('manga_rd_cols',String(n))}catch(e){}
   document.getElementById('rd-grid').style.gridTemplateColumns='repeat('+n+',1fr)';
 }
 function rdPager(totalPages,countDesc){
@@ -1453,11 +1715,13 @@ function rdRenderGrid(){
   const pageItems=rdItems.slice(start,start+RD_PAGE_SIZE);
   grid.innerHTML=pageItems.map((it,i)=>{
     const idx=start+i;
-    const sub=it.artist||it.parody||'';
-    return '<div class="rd-card" onclick="rdOpen('+idx+')">'+
-      '<img class="rd-thumb" loading="lazy" alt="" data-name="'+esc(it.name)+'" data-size="'+it.size+'">' +
-      '<div class="rd-meta"><div class="rd-name">'+esc(it.title||it.name)+'</div>'+
-      '<div class="rd-sub">'+esc(sub)+'</div></div></div>';
+    const sub=it.page_count?('共 '+it.page_count+' 页'):'页数未知';
+    const date=it.year?((it.year||'')+'-'+String(it.month||0).padStart(2,'0')+'-'+String(it.day||0).padStart(2,'0')):'';
+    return '<div class="rd-card">'+
+      '<img class="rd-thumb" style="cursor:pointer" onclick="rdOpen('+idx+')" loading="lazy" alt="" data-name="'+esc(it.name)+'" data-size="'+it.size+'">' +
+      '<div class="rd-meta rd-meta-btn" onclick="rdShowDetail('+idx+')" title="查看元数据并筛选">'+
+      '<div class="rd-name">'+esc(it.title_original||it.title||it.name)+'</div>'+
+      '<div class="rd-meta-row"><span>'+esc(sub)+'</span><span class="rd-date">'+esc(date)+'</span></div></div></div>';
   }).join('')||'<div class="rd-loading">没有符合条件的漫画</div>';
   rdFillThumbs(grid);
   rdPager(Math.ceil(rdItems.length/RD_PAGE_SIZE),
@@ -1465,15 +1729,26 @@ function rdRenderGrid(){
 }
 function rdOpen(i){
   rdView=rdItems[i];
-  fetch('/api/reader/pages?'+new URLSearchParams({name:rdView.name,src_dir:rdDir()}))
+  // 点开就立刻进全屏, 不等 pages 接口: 首屏先给个轻量加载提示
+  history.pushState({mangaReader:1},'');rdHistoryPushed=true;
+  document.documentElement.classList.add('rd-open');
+  document.body.classList.add('rd-open');
+  document.getElementById('reader-modal').classList.add('show');
+  document.getElementById('rd-view-title').textContent=rdView.title_original||rdView.title||rdView.name;
+  document.getElementById('rd-page-no').textContent='加载中…';
+  document.getElementById('rd-mode-btn').textContent=
+    (RD_MODES.find(m=>m[0]===rdMode())||RD_MODES[0])[1];
+  const opened=rdView;
+  // 首帧直接用已缓存的缩略图(后台预热过, 本地秒出), 不等整包下载
+  const thumb='/api/reader/thumb?'+new URLSearchParams({
+    name:opened.name,size:opened.size||0,src_dir:rdDir()});
+  document.getElementById('rd-stage').innerHTML=
+    '<img src="'+thumb+'" style="max-width:100%;max-height:100%;object-fit:contain">';
+  fetch('/api/reader/pages?'+new URLSearchParams({name:opened.name,src_dir:rdDir(),size:opened.size||0}))
     .then(r=>r.json()).then(d=>{
-      if(d.error){alert(d.error);return;}
+      if(d.error){alert(d.error);rdClose();return;}
+      if(rdView!==opened)return;
       rdView.pages=d.pages;rdPageIdx=0;
-      history.pushState({mangaReader:1},'');rdHistoryPushed=true;
-      document.documentElement.classList.add('rd-open');
-      document.body.classList.add('rd-open');
-      document.getElementById('reader-modal').classList.add('show');
-      document.getElementById('rd-view-title').textContent=rdView.title||rdView.name;
       rdRenderPage();
     });
 }
@@ -1492,14 +1767,39 @@ function rdCycleMode(){
 }
 function rdPageUrl(entry){
   return '/api/reader/page?'+new URLSearchParams({
-    name:rdView.name,src_dir:rdDir(),entry:entry});
+    name:rdView.name,src_dir:rdDir(),entry:entry,size:rdView.size||0});
 }
 function rdRenderPage(){
   if(!rdView)return;
   const stage=document.getElementById('rd-stage');
   const mode=rdMode();
   stage.classList.toggle('scroll-mode',false);
-  stage.innerHTML='<img src="'+rdPageUrl(rdView.pages[rdPageIdx])+'">';
+  // seq 防止快速连点时旧页的回调覆盖新页
+  const seq=(rdPageReq||0)+1;rdPageReq=seq;
+  const url=rdPageUrl(rdView.pages[rdPageIdx]);
+  const apply=()=>{
+    if(rdPageReq!==seq)return;
+    let img=stage.querySelector('img');
+    if(!img||img.dataset.manga!==rdView.name){
+      stage.innerHTML='<img data-manga="'+esc(rdView.name)+'">';
+      img=stage.querySelector('img');
+    }
+    if(img.getAttribute('src')!==url)img.src=url;
+  };
+  // 关键: 先判断浏览器缓存里是否已有这张图。命中就直接换现有 img 的 src,
+  // 同帧出图, 绝不重建元素 —— 重建 img 才会闪黑。
+  const pre=new Image();
+  pre.onload=apply;pre.onerror=apply;pre.src=url;
+  if(pre.complete&&(pre.naturalWidth>0||pre.naturalHeight>0)){
+    apply();
+  }else{
+    // 真要等网络: 清掉旧图, 不用旧页冒充新页; 加载好由 apply 填入
+    stage.innerHTML='<img data-manga="'+esc(rdView.name)+'" data-seq="'+seq+'">';
+  }
+  // 顺手预加载前后各一页(只填浏览器缓存, 不改当前显示)
+  [rdPageIdx-1,rdPageIdx+1].forEach(n=>{
+    if(n>=0&&n<rdView.pages.length){const p=new Image();p.src=rdPageUrl(rdView.pages[n])}
+  });
   stage.scrollTop=0;
   document.getElementById('rd-page-no').textContent=
     (rdPageIdx+1)+' / '+rdView.pages.length;
@@ -1601,7 +1901,7 @@ document.addEventListener('keydown',e=>{
 });
 
 // ---- 扫描 ----
-function doScan(){
+function doScan(){rdDirHistPush(scanDir());
   const dirs=document.getElementById('scan-dir').value;
   const db=document.getElementById('scan-db').value;
   const rescan=document.getElementById('rescan').checked;
@@ -1610,6 +1910,7 @@ function doScan(){
     body:JSON.stringify({dirs,db,rescan,recursive})})
     .then(r=>r.json()).then(d=>{
       scanId=d.scan_id;
+      try{localStorage.setItem('manga_scan_id',scanId)}catch(e){}
       document.getElementById('scan-log').textContent='';
       logShown=0;
       document.getElementById('scan-status').textContent='扫描中...';
@@ -1656,6 +1957,25 @@ function renderProgress(p,running){
   if(fill&&total>0)fill.style.width=pct+'%';
 }
 
+function restoreScan(){
+  let sid=null;
+  try{sid=localStorage.getItem('manga_scan_id')}catch(e){}
+  fetch('/api/scan/current').then(r=>r.json()).then(d=>{
+    const id=d.scan_id||sid;
+    if(!id)return;
+    fetch('/api/scan/status?id='+encodeURIComponent(id)).then(r=>r.json()).then(s=>{
+      if(s.error)return;
+      scanId=id;
+      document.getElementById('scan-log').textContent='';
+      logShown=0;
+      appendLog(s.log);
+      renderProgress(s.progress,s.running);
+      document.getElementById('scan-status').textContent=s.running?'扫描中...':'扫描已结束';
+      document.getElementById('btn-stop').disabled=!s.running;
+      if(s.running)pollScan();
+    });
+  });
+}
 function pollScan(){
   if(pollTimer)clearInterval(pollTimer);
   pollTimer=setInterval(()=>{
@@ -1664,6 +1984,7 @@ function pollScan(){
       renderProgress(d.progress,d.running);
       if(!d.running){
         clearInterval(pollTimer);pollTimer=null;
+        try{localStorage.removeItem('manga_scan_id')}catch(e){}
         document.getElementById('btn-stop').disabled=true;
         document.getElementById('scan-prog').classList.add('hidden');
         const pl=document.getElementById('scan-progress-line');
@@ -1773,8 +2094,33 @@ function cols2obj(cols,row){
   const o={};cols.forEach((c,i)=>o[c]=row[i]);return o;
 }
 
+// ---- 阅读页: 点文字区看元数据, 多选值加为筛选条件 ----
+let mdPick=[];
+function rdShowDetail(idx){
+  const it=rdItems[idx];if(!it)return;
+  mdPick=[];
+  showDetail(it.name, true);
+}
+function mdToggle(field,value){
+  const k=field+'\u0001'+value;
+  const at=mdPick.findIndex(x=>x.k===k);
+  if(at>=0)mdPick.splice(at,1);
+  else mdPick.push({k:k,field:field,value:value});
+  document.querySelectorAll('.md-chip').forEach(e=>e.classList.remove('on'));
+  mdPick.forEach(x=>{
+    const t=document.querySelector('.md-chip[data-k="'+CSS.escape(x.k)+'"]');
+    if(t)t.classList.add('on');
+  });
+}
+function mdApply(){
+  if(!mdPick.length){closeDetail();return}
+  for(const x of mdPick)rdAddCondRow(x.field,'contains',x.value);
+  closeDetail();
+  rdLoad();
+}
+
 // ---- 详情 ----
-function showDetail(name){
+function showDetail(name, pickable){
   fetch('/api/detail?name='+encodeURIComponent(name)).then(r=>r.json()).then(d=>{
     const el=document.getElementById('detail-content');
     if(d.error){el.innerHTML='<p>'+esc(d.error)+'</p>';return;}
@@ -1789,8 +2135,15 @@ function showDetail(name){
       if(k=='has_meta')v=v?'是':'否';
       if(k=='translated')v=v?'是':'否';
       if(v===null||v===undefined||v==='')continue;
-      html+='<div class="detail-pair"><div class="detail-key">'+
-        (cnMap[k]||k)+'</div><div class="detail-val">'+esc(String(v))+'</div></div>';
+      if(pickable&&RD_FIELDS[k]){
+        const vals=String(v).split(/[,，]/).map(x=>x.trim()).filter(Boolean);
+        html+='<div class="md-group"><b>'+(cnMap[k]||RD_FIELDS[k])+'</b>'+
+          vals.map(x=>'<span class="md-chip" data-k="'+esc(k+'\u0001'+x)+
+            '" onclick="mdToggle(\''+k+'\',\''+esc(x)+'\')">'+esc(x)+'</span>').join('')+'</div>';
+      }else{
+        html+='<div class="detail-pair"><div class="detail-key">'+
+          (cnMap[k]||k)+'</div><div class="detail-val">'+esc(String(v))+'</div></div>';
+      }
     }
     if(d.other_fields){
       const of=typeof d.other_fields=='string'?JSON.parse(d.other_fields):d.other_fields;
@@ -1955,7 +2308,7 @@ function addCond(field,op,value){
   const div=document.createElement('div');
   div.className='cond';div.id='cond-'+id;
   div.innerHTML='<span class="cond-idx">'+(document.getElementById('cls-conds').children.length+1)+'</span>'+
-    '<select class="c-field">'+CLS_FIELDS.map(f=>
+    '<select class="c-field" onchange="rdLoad()">'+CLS_FIELDS.map(f=>
       '<option value="'+f[0]+'"'+(f[0]===(field||'artist')?' selected':'')+'>'+f[1]+'</option>').join('')+'</select>'+
     '<select class="c-op">'+CLS_OPS.map(o=>
       '<option value="'+o[0]+'"'+(o[0]===(op||'eq')?' selected':'')+'>'+o[1]+'</option>').join('')+'</select>'+
@@ -2438,6 +2791,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._json(API.query(field, value, contains, scope=scope))
             return
+        if path == "/api/cache/stats":
+            try:
+                self._json(reader.cache_stats(
+                    int(qs.get("max_mb", [str(reader.CACHE_DEFAULT_MAX_MB)])[0])))
+            except Exception as ex:
+                self._json({"error": str(ex)})
+            return
         if path == "/api/scope":
             n = LAST_SCAN["names"]
             self._json({"scan_count": (len(n) if n is not None else None),
@@ -2446,6 +2806,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/detail":
             name = qs.get("name", [""])[0]
             self._json(API.detail(name))
+            return
+        if path == "/api/scan/current":
+            active = [sid for sid, w in SCAN_WORKERS.items() if w.get("running")]
+            self._json({"scan_id": active[-1] if active else None,
+                        "active": bool(active)})
             return
         if path == "/api/scan/status":
             sid = qs.get("id", [""])[0]
@@ -2491,7 +2856,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/reader/pages":
             name = qs.get("name", [""])[0]
             src_dir = qs.get("src_dir", [""])[0]
-            self._json(API.reader_pages(name, src_dir))
+            self._json(API.reader_pages(name, src_dir,
+                                        qs.get("size", ["0"])[0]))
             return
         if path == "/api/reader/thumb":
             name = qs.get("name", [""])[0]
@@ -2506,7 +2872,8 @@ class Handler(BaseHTTPRequestHandler):
             name = qs.get("name", [""])[0]
             src_dir = qs.get("src_dir", [""])[0]
             entry = qs.get("entry", [""])[0]
-            got = API.reader_page_image(name, src_dir, entry)
+            got = API.reader_page_image(name, src_dir, entry,
+                                        qs.get("size", ["0"])[0])
             if not got:
                 self.send_error(404)
                 return
@@ -2576,7 +2943,15 @@ class Handler(BaseHTTPRequestHandler):
                                        body.get("conditions", []),
                                        body.get("join", "and"),
                                        body.get("scope", "scan"),
-                                       body.get("limit", 200)))
+                                       body.get("limit", 200),
+                                       force=bool(body.get("force"))))
+            return
+        if path == "/api/cache/clear":
+            try:
+                reader.clear_cache()
+                self._json({"ok": True})
+            except Exception as ex:
+                self._json({"error": str(ex)})
             return
         if path == "/api/source":
             src_dir = body.get("src_dir", "")
