@@ -6,7 +6,7 @@
 搬到哪去了", 不该到处写 `if 远程`。所以这里定义 Source:
 
     LocalSource   —— 本地磁盘, os / shutil
-    远程由 RcloneSource 实现, 走 rclone 子进程
+    远程由 WebDavHttpSource 实现, 走 Python WebDAV HTTP
 
 路径约定: 远程写成 `remote:path`(如 `123:/本图/本子zip`), 本地就是
 普通绝对路径。`get_source()` 按这个自动分派。
@@ -19,7 +19,7 @@
     这里直接拒绝, 绝不调用 —— 调了只会一路重试到超时, 界面像卡死。
   * moveto 会**静默覆盖**已存在的目标。本项目的口径是"目标已存在就
     跳过、不覆盖", 所以移动前必须自己先查一次。
-  * 远程 zip 可以用 `rclone cat --offset/--count` 做区间读, 包成
+  * 远程 zip 用 HTTP Range 做区间读, 包成
     RemoteFile 就能直接交给 zipfile, 不用下载整个文件。
 
 注意: 本模块不在文件顶层 import scanner / fileops(避免循环依赖),
@@ -30,16 +30,18 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import threading
 import time
+import urllib.request
+import urllib.parse
+import base64
 from datetime import datetime
 
-# 单个 rclone 命令的超时。列目录在大库上实测动辄 20 秒以上,
+# 单个 WebDAV HTTP 请求超时。列目录在大库上可能较久,
 # 单文件操作 0.7 秒; 分开设, 别让大目录整根失败。
-RCLONE_LIST_TIMEOUT = 300
-RCLONE_OP_TIMEOUT = 60
-RCLONE_TIMEOUT = RCLONE_OP_TIMEOUT      # 兼容旧引用
+HTTP_LIST_TIMEOUT = 300
+HTTP_OP_TIMEOUT = 60
+HTTP_TIMEOUT = HTTP_OP_TIMEOUT      # 兼容旧引用
 
 # 远程解析的并发度。实测(123 云盘 WebDAV, 2026-10-24):
 #   * 并发 2 跑几十个没问题, 但连续读一大批后服务端开始限流,
@@ -69,13 +71,29 @@ NOTICE_EXT = (".rar", ".7z")
 
 
 class SourceError(Exception):
-    """数据源操作失败(网络、权限、rclone 不存在等)。"""
+    """数据源操作失败(网络、权限、WebDAV 配置缺失等)。"""
 
 
 # 远程不支持复制时的统一文案。123 云盘 WebDAV 的 COPY 实测返回
 # 500 Internal Server Error, 调用只会白等, 所以直接告诉用户改移动。
 COPY_UNSUPPORTED = ("该远程不支持复制(123 云盘 WebDAV 的 COPY 返回 500), "
                     "请改用移动")
+
+
+def _parse_modtime(value):
+    """把 HTTP/RFC3339 时间转 epoch 秒; 空/无效返回 0。"""
+    if not value:
+        return 0
+    try:
+        from email.utils import parsedate_to_datetime
+        return int(parsedate_to_datetime(value).timestamp())
+    except Exception:
+        pass
+    try:
+        v = value.strip().replace("Z", "+00:00")
+        return int(datetime.fromisoformat(v).timestamp())
+    except Exception:
+        return 0
 
 
 # ------------------------------------------------------------------ 路径识别
@@ -120,7 +138,7 @@ def _remote_name(path):
 
 
 def same_store(a, b):
-    """两个根是否在同一存储上(本地对本地, 或同一个 rclone remote)。
+    """两个根是否在同一存储上(本地对本地, 或同一个 WebDAV remote)。
 
     跨存储搬运只能下载再上传, 本项目不做 —— 所以除了"同为本地"和
     "同一个 remote", 其余都要在入口处拒绝。
@@ -134,196 +152,6 @@ def same_store(a, b):
 
 
 # ------------------------------------------------------------------ 远程文件
-
-class RemoteFile:
-    """把 `rclone cat --offset/--count` 包成可 seek 的只读文件对象。
-
-    zipfile 需要 seek 到文件尾部读中央目录, 再按需读每个条目。
-    每次都区间读, 不落地整个文件。
-    """
-
-    def __init__(self, path, size, run=None):
-        self.path = path
-        self.size = int(size or 0)
-        self.pos = 0
-        self.calls = 0
-        self._start = 0
-        self._buf = b""
-        self._run = run or _rclone_cat
-
-    # zipfile 会把这些属性都问一遍
-    def seekable(self):
-        return True
-
-    def readable(self):
-        return True
-
-    def writable(self):
-        return False
-
-    def tell(self):
-        return self.pos
-
-    def seek(self, offset, whence=0):
-        if whence == 0:
-            new = offset
-        elif whence == 1:
-            new = self.pos + offset
-        elif whence == 2:
-            new = self.size + offset
-        else:
-            raise ValueError(f"无效 whence: {whence}")
-        if new < 0:
-            raise ValueError("seek 到负数位置")
-        self.pos = new
-        return self.pos
-
-    def close(self):
-        self._buf = b""
-
-    # scan_one 用 `with src.open_file(rel) as fh:` 统一本地/远程
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
-        return False
-
-    def read(self, n=-1):
-        if n is None or n < 0:
-            n = self.size - self.pos
-        n = min(n, self.size - self.pos)
-        if n <= 0:
-            return b""
-        end = self.pos + n
-        # 命中上一次的读缓冲就不发请求
-        if self._start <= self.pos and end <= self._start + len(self._buf):
-            off = self.pos - self._start
-            data = self._buf[off:off + n]
-            self.pos = end
-            return data
-        # 从尾部往前读时一次预读一大块: zipfile 的典型动作是
-        # seek(-22, 2) 读 EOCD, 紧接着读中央目录 —— 两者都在尾部。
-        # 预读 1MB 让他们命中同一块缓冲区, 请求数减半。
-        if self.pos >= self.size - READAHEAD:
-            start = max(0, self.size - READAHEAD)
-            want = self.size - start
-        else:
-            start = self.pos
-            want = min(max(n, READAHEAD), self.size - self.pos)
-        self._buf = self._run(self.path, start, want)
-        self.calls += 1
-        self._start = start
-        off = self.pos - start
-        data = self._buf[off:off + n]
-        self.pos += len(data)
-        return data
-
-
-def _rclone_cat(path, offset, count):
-    """区间读。空响应和**短响应**都要重试。
-
-    123 的 WebDAV 在并发稍高或连续读很多时, 会直接回**空内容**或
-    **少于请求长度**的内容(退出码 0、没有报错), 不是慢, 是服务端限流。
-    若不判断, zipfile 会拿残缺数据去解析, 报 "File is not a zip file"
-    —— 看着像文件坏了, 实际是服务端的问题。
-    """
-    got = b""
-    for attempt in range(READ_RETRIES + 1):
-        chunk = _rclone(["cat", path, "--offset", str(offset + len(got)),
-                         "--count", str(count - len(got))],
-                        timeout=RCLONE_OP_TIMEOUT)
-        got += chunk
-        if len(got) >= count or count <= 0:
-            return got
-        if attempt < READ_RETRIES:
-            time.sleep(READ_RETRY_WAIT * (attempt + 1))   # 退避, 别越催越糟
-    # 重试完还是不够: 这是限流, 不是文件坏了。必须明确说出来,
-    # 否则 zipfile 只会报 "File is not a zip file", 把人引向错误的排查方向。
-    raise SourceError(
-        f"远程读取返回的内容不完整(限流或服务端异常), 已重试 "
-        f"{READ_RETRIES} 次: {path.rsplit('/', 1)[-1]} "
-        f"@ {offset}+{count} (拿到 {len(got)} 字节)")
-
-
-# ------------------------------------------------------------------ rclone 调用
-
-# rclone 会把这些环境变量当作全局过滤规则。单文件的 cat/moveto 一旦
-# 带着过滤规则, 1.75 会直接报 "can't limit to single files when using
-# filters", 连 123 云盘都还没访问就失败了。列目录不需要过滤, 单文件
-# 操作更不需要 —— 所以子进程里一律剔除。
-_RCLONE_FILTER_ENV = (
-    # 直接给命令行追加 --filter / --exclude / --include
-    "RCLONE_EXCLUDE", "RCLONE_FILTER", "RCLONE_INCLUDE",
-    "RCLONE_FILTER_FROM", "RCLONE_EXCLUDE_FROM", "RCLONE_INCLUDE_FROM",
-    # --files-from 系列也会让 rclone 认为"只在清单里操作", 同样不能用于
-    # 本项目逐文件的 cat/moveto。
-    "RCLONE_FILES_FROM", "RCLONE_FILES_FROM_RAW", "RCLONE_FILES_FROM0",
-    # 元数据过滤
-    "RCLONE_METADATA_FILTER", "RCLONE_METADATA_EXCLUDE",
-    "RCLONE_METADATA_FILTER_FROM", "RCLONE_METADATA_EXCLUDE_FROM",
-    # 其它会转化成过滤规则的条件(实测 MAX_SIZE 也触发同样的报错)
-    "RCLONE_EXCLUDE_IF_PRESENT", "RCLONE_MAX_SIZE", "RCLONE_MIN_SIZE",
-    "RCLONE_MAX_AGE", "RCLONE_MIN_AGE",
-)
-
-
-def _rclone_env():
-    """给 rclone 子进程用的环境: 保留配置, 去掉全局过滤规则。"""
-    env = dict(os.environ)
-    for key in _RCLONE_FILTER_ENV:
-        env.pop(key, None)
-    return env
-
-
-def _rclone(args, timeout=RCLONE_OP_TIMEOUT):
-    """跑一条 rclone, 返回 stdout(bytes)。失败抛 SourceError。
-
-    参数以列表传入, 不经 shell, 所以没有命令注入面。远程路径总是
-    `remote:/...` 形式(以 remote 名开头), 不会被当成选项 —— 这一点
-    与拼字符串调 shell 的实现有本质区别。
-    """
-    cmd = ["rclone"] + list(args)
-    try:
-        p = subprocess.run(cmd, capture_output=True,
-                           timeout=timeout, env=_rclone_env())
-    except FileNotFoundError:
-        raise SourceError("找不到 rclone, 请先安装并配置好 remote")
-    except subprocess.TimeoutExpired:
-        raise SourceError(f"rclone 超时({timeout}s): {' '.join(args[:3])}")
-    if p.returncode != 0:
-        err = (p.stderr or b"").decode("utf-8", "replace").strip()
-        last = err.split("\n")[-1] if err else ""
-        raise SourceError(f"rclone 失败(退出码 {p.returncode}): {last or '未知错误'}")
-    return p.stdout
-
-
-def _parse_modtime(s):
-    """rclone 的 ModTime(RFC3339, 可能带 Z / 偏移) -> epoch 秒。
-
-    取不到就返回 0 —— 调用方把 0 当作"不知道", 会重新解析,
-    宁可多读一次也不能漏掉改动。
-    """
-    if not s:
-        return 0
-    s = str(s).strip()
-    if not s:
-        return 0
-    try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return int(dt.timestamp())
-    except ValueError:
-        pass
-    # 兜底: 老格式 "2026-06-11 13:40:24"
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            return int(time.mktime(time.strptime(s, fmt)))
-        except ValueError:
-            continue
-    return 0
-
-
-# ------------------------------------------------------------------ Source 接口
 
 class Source:
     """数据源接口。上层只依赖这些方法。
@@ -353,6 +181,14 @@ class Source:
         """可 seek 的只读文件对象(zipfile 用)。"""
         raise NotImplementedError
 
+    def open_path(self, rel, size=0):
+        """按路径直接打开, 不依赖目录清单缓存。
+
+        阅读页的文件列表以文件源为准, 可能还没入库; 扫描会清掉远程目录
+        缓存。此时 open_file 的 _lookup 会失败, 必须能按完整路径直开。
+        """
+        raise NotImplementedError
+
     def join(self, rel):
         return join(self.root, rel)
 
@@ -367,7 +203,7 @@ class Source:
 class LocalSource(Source):
     """本地磁盘。
 
-    接口与 RcloneSource 对齐; 扫描/搬移的本地路径仍然走 scanner /
+    接口与 WebDavHttpSource 对齐; 扫描/搬移的本地路径仍然走 scanner /
     fileops 里原有的实现(行为完全不变), 这个类供分类层在显式传入
     数据源时统一使用, 也用于测试本地与远程的口径一致。
     """
@@ -420,6 +256,11 @@ class LocalSource(Source):
 
     def open_file(self, rel):
         return open(self._abs(rel), "rb")
+
+    def open_path(self, rel, size=0):
+        if is_remote(rel):
+            raise SourceError("本地数据源不接受远程路径")
+        return open(rel, "rb")
 
     def move(self, src_rel, dst_rel):
         """移动: 复制 + 校验大小 + 删源(与 fileops 本地口径一致)。"""
@@ -480,266 +321,212 @@ def _silent_remove(path):
         pass
 
 
-class RcloneSource(Source):
-    """rclone 远程。
+class WebDavHttpSource(Source):
+    """WebDAV HTTP Range 直读数据源(阅读器用, 不行写)。
 
-    文件清单一次列全并缓存: 网络往返很贵, 而增量判断、预览、
-    搬移都会反复问"这个文件多大/在不在"。
+    凭据来自 .env/WEBDAV_*, 不进代码。WebDAV 路径按 remote:/path 映射:
+    remote 名必须在 WEBDAV_REMOTES 中, 或只有一个 remote 时任意名字都接受。
     """
 
-    kind = "rclone"
-    # 123 云盘 WebDAV 的 COPY 返回 500。别的 remote 若支持也可以改成 True,
-    # 但没验证过就不冒险 —— 换来的只是慢和看起来卡死。
+    kind = "webdav-http"
     supports_copy = False
 
-    def __init__(self, root):
+    def __init__(self, root, url, user, password):
         super().__init__(root.rstrip("/") or root)
-        # {recursive: {rel: (size, mtime)}} —— 递归与非递归的清单不同,
-        # 分开缓存。拿递归清单筛顶层也能用, 但递归列大目录很贵,
-        # 不能因为一次非递归调用就把便宜的路径变贵。
-        self._files = {}
-        self._lock = threading.Lock()
+        self.url = url.rstrip("/")
+        self.user = user
+        self.password = password
+        _name, self.base = split_remote(root)
+        self.base = self.base.rstrip("/") or "/"
+        self._auth = "Basic " + base64.b64encode(
+            (user + ":" + password).encode()).decode()
+        self._opener = urllib.request.build_opener()
 
-    # -- 内部 -------------------------------------------------------------
-    def _root(self):
-        return self.root
+    def _full_url(self, rel):
+        rel = (rel or "").lstrip("/")
+        base = self.base.strip("/")
+        # 上层可能传相对路径, 也可能传从 PROPFIND href 解出的完整 web 路径。
+        # 后者已经包含 base, 不能再拼一次, 否则会变成 /base/base/xxx。
+        if base and (rel == base or rel.startswith(base + "/")):
+            path = rel
+        else:
+            path = (base + "/" + rel).lstrip("/") if base else rel
+        return self.url + "/" + urllib.parse.quote(path)
 
-    def _run(self, args, timeout=RCLONE_OP_TIMEOUT):
-        return _rclone(args, timeout=timeout)
-
-    def _ensure(self, recursive=True):
-        """取清单。同一层级的清单只拉一次, 之后纯内存查表。"""
-        rec = bool(recursive)
-        hit = self._files.get(rec)
-        if hit is not None:
-            return hit
-        with self._lock:
-            hit = self._files.get(rec)
-            if hit is not None:
-                return hit
-            args = ["lsjson", self.root, "--files-only"]
-            if rec:
-                args.append("-R")
-            out = self._run(args, timeout=RCLONE_LIST_TIMEOUT)
-            try:
-                items = json.loads(out.decode("utf-8", "replace") or "[]")
-            except ValueError as e:
-                raise SourceError(f"解析 rclone 输出失败: {e}")
-            files = {}
-            for it in items:
-                if it.get("IsDir"):
-                    continue
-                rel = it.get("Path") or it.get("Name") or ""
-                if not rel:
-                    continue
-                files[rel] = (int(it.get("Size") or 0),
-                              _parse_modtime(it.get("ModTime")))
-            self._files[rec] = files
-            return files
-
-    def _lookup(self, rel):
-        """在已缓存的清单里找 rel; 先查递归清单, 再查顶层清单。
-
-        rel 允许是完整远程路径(`123:/root/a.zip`), 会自动去掉根前缀 ——
-        调用方常常手里拿着完整路径, 不该逼它自己算相对路径。
-        """
-        rel = self._norm(rel)
-        for rec in (True, False):
-            files = self._files.get(rec)
-            if files is not None and rel in files:
-                return files[rel]
-        # 缓存里没有: 拉顶层(便宜), 还不够再拉递归(贵)
-        if rel in self._ensure(False):
-            return self._files[False][rel]
-        return self._ensure(True).get(rel)
-
-    def _norm(self, rel):
-        """完整远程路径 -> 相对本根的路径; 相对路径原样返回。"""
-        if not rel:
-            return ""
-        if is_remote(rel):
-            prefix = self.root.rstrip("/") + "/"
-            if rel.startswith(prefix):
-                return rel[len(prefix):]
-            # 不在本根下面: 原样保留, 查不到就是查不到
-            return rel
-        return rel.lstrip("/")
+    def _xml_body(self, rel, depth="0"):
+        req = urllib.request.Request(self._full_url(rel),
+            headers={"Authorization": self._auth, "Depth": depth},
+            data=b"<?xml version=\"1.0\"?><d:propfind xmlns:d=\"DAV:\"><d:prop><d:resourcetype/><d:getcontentlength/><d:getlastmodified/></d:prop></d:propfind>",
+            method="PROPFIND")
+        r = self._opener.open(req, timeout=HTTP_LIST_TIMEOUT)
+        return r.read()
 
     def list_archives(self, recursive=True):
-        files = self._ensure(recursive)
+        """用 PROPFIND Depth:1/infinity 列出 zip/cbz。返回 (rel,name,size,mtime)。"""
+        import xml.etree.ElementTree as ET
+        data = self._xml_body("", "infinity" if recursive else "1")
+        root = ET.fromstring(data)
+        ns = {"d": "DAV:"}
         out = []
-        for rel, (size, mtime) in files.items():
-            name = rel.rsplit("/", 1)[-1]
-            if os.path.splitext(name)[1].lower() not in ARCHIVE_EXT:
+        for resp in root.findall("d:response", ns):
+            href = resp.findtext("d:href", "", ns)
+            if not href: continue
+            path = urllib.parse.unquote(urllib.parse.urlparse(href).path)
+            base = (urllib.parse.urlparse(self.url).path.rstrip("/") + "/" +
+                    self.base.strip("/")).rstrip("/")
+            rel = path[len(base):].lstrip("/") if path.startswith(base) else path.lstrip("/")
+            isdir = resp.find("d:resourcetype/d:collection", ns) is not None
+            if isdir or not rel.lower().endswith(ARCHIVE_EXT):
                 continue
-            if not recursive and "/" in rel:
-                continue
-            out.append((rel, name, size, mtime))
-        out.sort(key=lambda x: x[0])
+            size = int(resp.findtext("d:propstat/d:prop/d:getcontentlength", "0", ns) or 0)
+            lm = resp.findtext("d:propstat/d:prop/d:getlastmodified", "", ns)
+            mtime = _parse_modtime(lm)
+            out.append((rel, os.path.basename(rel), size, mtime))
         return out
 
     def list_notice(self, recursive=True):
-        """rar/7z —— 只统计不解析, 与本地口径一致。"""
-        files = self._ensure(recursive)
+        """列出不支持解析但需提示的压缩包(rar/7z)。"""
+        import xml.etree.ElementTree as ET
+        data = self._xml_body("", "infinity" if recursive else "1")
+        root = ET.fromstring(data)
+        ns = {"d": "DAV:"}
         out = []
-        for rel in files:
-            name = rel.rsplit("/", 1)[-1]
-            if os.path.splitext(name)[1].lower() not in NOTICE_EXT:
+        for resp in root.findall("d:response", ns):
+            href = resp.findtext("d:href", "", ns)
+            if not href: continue
+            path = urllib.parse.unquote(urllib.parse.urlparse(href).path)
+            base = (urllib.parse.urlparse(self.url).path.rstrip("/") + "/" +
+                    self.base.strip("/")).rstrip("/")
+            rel = path[len(base):].lstrip("/") if path.startswith(base) else path.lstrip("/")
+            isdir = resp.find("d:resourcetype/d:collection", ns) is not None
+            if isdir or not rel.lower().endswith(NOTICE_EXT):
                 continue
-            if not recursive and "/" in rel:
-                continue
-            out.append(self.join(rel))
+            out.append(rel)
         return out
 
     def exists(self, rel):
-        return self._lookup(rel) is not None
+        try:
+            req = urllib.request.Request(self._full_url(rel),
+                headers={"Authorization": self._auth}, method="HEAD")
+            r = self._opener.open(req, timeout=HTTP_OP_TIMEOUT)
+            return 200 <= r.status < 400
+        except Exception:
+            return False
 
     def size(self, rel):
-        hit = self._lookup(rel)
-        return hit[0] if hit else 0
-
-    def mtime(self, rel):
-        hit = self._lookup(rel)
-        return hit[1] if hit else 0
-
-    def open_file(self, rel):
-        rel = self._norm(rel)
-        hit = self._lookup(rel)
-        if hit is None:
-            raise SourceError(f"远程文件不存在: {rel}")
-        return RemoteFile(self.join(rel), hit[0])
-
-    def stat(self, rel):
-        """目标文件的真实状态, 绕过缓存。返回 (exists, size)。
-
-        rel 可以是相对本根源的路径, 也可以是 `123:/...` 完整路径 —
-        目标目录通常不在源根下面(分类整理就是搬去别的目录)。
-        """
-        return self._stat_path(self.join_any(rel))
-
-    def join_any(self, rel):
-        """相对路径补上本根; 已经是完整远程路径就原样返回。"""
-        if is_remote(rel):
-            return rel
-        return self.join(rel)
-
-    def _stat_path(self, path):
         try:
-            out = self._run(["lsjson", path, "--stat", "--no-mimetype"])
-        except SourceError as e:
-            msg = str(e)
-            # 退出码 3 / directory not found = 文件不存在, 不是错误
-            if "退出码 3" in msg or "not found" in msg:
-                return False, 0
-            raise
-        try:
-            d = json.loads(out.decode("utf-8", "replace") or "{}")
-        except ValueError:
-            return False, 0
-        if not d or d.get("IsDir"):
-            return False, 0
-        return True, int(d.get("Size") or 0)
+            req = urllib.request.Request(self._full_url(rel),
+                headers={"Authorization": self._auth}, method="HEAD")
+            r = self._opener.open(req, timeout=HTTP_OP_TIMEOUT)
+            return int(r.headers.get("Content-Length") or 0)
+        except Exception:
+            return 0
 
-    def ensure_dir(self, path):
-        """确保远程目录存在。path 可以是相对本根或完整远程路径。
-
-        本地搬运靠 os.makedirs 建分类目录; 远程 moveto 虽然在某些
-        WebDAV 后端会自动补父目录, 但项目需要明确建出「标签/标签值」
-        这类目录, 不能依赖服务端隐式行为, 也不能只在日志里显示路径。
-        """
-        self._run(["mkdir", self.join_any(path)])
-
-    # -- 搬移 -------------------------------------------------------------
     def move(self, src_rel, dst_rel):
-        """服务端移动。目标已存在时不覆盖(本项目口径)。
-
-        src_rel / dst_rel 都可以是相对本根的路径, 也可以是完整远程路径
-        (分类整理的目标目录通常不在源根下面)。
-
-        rclone moveto 会静默覆盖已有文件, 所以必须先查目标:
-          * 不存在      -> 搬
-          * 存在且同大小 -> 跳过
-          * 存在但不同   -> 失败, 报两个大小, 由用户判断
-        """
-        src_rel = self._norm(src_rel)
-        dst_path = self.join_any(dst_rel)
-        # 源是否存在要用**真实 stat**核实, 不能只看缓存: 缓存是整批列目录
-        # 时拉的, 用户可能在外部已经把文件搬走了。缓存说"在"就照搬,
-        # 结果只会拿到退出码 3, 还被报成"移动失败" —— 语义错了。
+        # WebDAV MOVE, 不覆盖已有目标
+        if self.exists(dst_rel): return "skip", "目标已存在, 不覆盖"
+        req = urllib.request.Request(self._full_url(src_rel), headers={
+            "Authorization": self._auth, "Destination": self._full_url(dst_rel),
+            "Overwrite": "F"}, method="MOVE")
         try:
-            src_there, want = self._stat_path(self.join(src_rel))
-        except SourceError as e:
-            return "fail", f"检查源文件失败: {e}"
-        if not src_there:
-            self._forget(src_rel)          # 顺手把过期的缓存清掉
-            return "missing", "源文件已不存在"
-        # 缓存说目标在, 也要用真实 stat 复核: 缓存可能过期
-        try:
-            there, got = self._stat_path(dst_path)
-        except SourceError as e:
-            return "fail", f"检查目标失败: {e}"
-        if there:
-            if got == want:
-                return "skip", "目标已存在且大小一致"
-            return "fail", (f"目标已存在且大小不同({got} != {want}), "
-                            "不覆盖, 请手动处理")
-        try:
-            self._run(["moveto", self.join(src_rel), dst_path,
-                       "--retries", "1", "--low-level-retries", "1"])
-        except SourceError as e:
-            return "fail", str(e)
-        # 搬完核对目标: 返回码 0 不等于真的到位(服务端偶发假成功)
-        try:
-            there, got = self._stat_path(dst_path)
-        except SourceError:
-            there, got = False, 0
-        if not there or got != want:
-            return "fail", (f"移动后校验失败: 目标大小 {got} != 源 {want}")
-        self._forget(src_rel)
-        self._remember(dst_path, want)
-        return "ok", ""
+            r = self._opener.open(req, timeout=HTTP_OP_TIMEOUT)
+            return "ok", f"HTTP {r.status}"
+        except Exception as e:
+            return "fail", str(e)[:200]
 
     def copy(self, src_rel, dst_rel):
-        """远程复制不支持。不调用 subprocess —— 调了会重试到超时。"""
-        return "unsupported", COPY_UNSUPPORTED
-
-    def delete(self, rel):
+        if self.exists(dst_rel): return "skip", "目标已存在, 不覆盖"
+        req = urllib.request.Request(self._full_url(src_rel), headers={
+            "Authorization": self._auth, "Destination": self._full_url(dst_rel),
+            "Overwrite": "F"}, method="COPY")
         try:
-            self._run(["deletefile", self.join(rel)])
-        except SourceError as e:
-            raise SourceError(f"删除失败: {e}")
-        self._forget(rel)
+            r = self._opener.open(req, timeout=HTTP_OP_TIMEOUT)
+            return "ok", f"HTTP {r.status}"
+        except Exception as e:
+            return "fail", str(e)[:200]
 
-    def _forget(self, rel):
-        key = self._norm(rel)
-        for files in self._files.values():
-            files.pop(key, None)
+    def stat(self, rel):
+        ok = self.exists(rel)
+        return ok, self.size(rel) if ok else 0
 
-    def _rel_key(self, path):
-        """完整远程路径 -> 清单的键(相对本根)。
+    def open_file(self, rel):
+        return self.open_path(rel)
 
-        清单的键一律是相对 root 的 rel。目标常在源根外面(分类整理就是
-        搬去别的目录), 那种路径不属于本根的清单, 返回 None —— 别往缓存
-        里塞一个永远不会被命中的完整路径键。
-        """
-        if not is_remote(path):
-            return None
-        prefix = self.root.rstrip("/") + "/"
-        if not path.startswith(prefix):
-            return None
-        return path[len(prefix):]
+    def join_any(self, rel):
+        return rel if is_remote(rel) else self.join(rel)
 
-    def _remember(self, path, size):
-        """把一条已知状态写进缓存(只写属于本根清单的键)。"""
-        key = self._rel_key(path)
-        if key is None:
-            return
-        for files in self._files.values():
-            files[key] = (size, int(time.time()))
+    def open_path(self, rel, size=0):
+        path = self.join_any(rel)
+        _name, webpath = split_remote(path)
+        url = self.url + "/" + urllib.parse.quote(webpath.lstrip("/"))
+        if not size:
+            size = self.size(rel)
+        return WebDavRangeFile(url, self._auth, size, self._opener)
 
-    def invalidate(self):
-        with self._lock:
-            self._files = {}
+class WebDavRangeFile:
+    """用 HTTP Range 实现可 seek 的只读文件对象。"""
+    def __init__(self, url, auth, size, opener):
+        self.url, self.auth, self.size = url, auth, int(size or 0)
+        self.pos = 0
+        self._buf = b""
+        self._start = 0
+        self._opener = opener
+
+    def seekable(self): return True
+    def readable(self): return True
+    def writable(self): return False
+    def tell(self): return self.pos
+    def seek(self, offset, whence=0):
+        new = offset if whence == 0 else (self.pos + offset if whence == 1
+              else self.size + offset)
+        if new < 0: raise ValueError("seek 到负数位置")
+        self.pos = new
+        return new
+    def close(self): self._buf = b""
+    def __enter__(self): return self
+    def __exit__(self, *a): self.close(); return False
+
+    def read(self, n=-1):
+        if n is None or n < 0: n = self.size - self.pos
+        n = min(n, self.size - self.pos)
+        if n <= 0: return b""
+        end = self.pos + n
+        if self._start <= self.pos and end <= self._start + len(self._buf):
+            off = self.pos - self._start
+            out = self._buf[off:off+n]; self.pos = end; return out
+        start = self.pos
+        want = min(max(n, 1024 * 1024), self.size - start)
+        stop = min(self.size, start + want) - 1
+        req = urllib.request.Request(self.url, headers={
+            "Authorization": self.auth,
+            "Range": f"bytes={start}-{stop}",
+        })
+        r = self._opener.open(req, timeout=HTTP_OP_TIMEOUT)
+        self._buf = r.read()
+        # 服务器可能忽略 Range 返回 200 + 整文件; 这时内容起点是 0,
+        # 不能当成从 start 开始的片段, 否则 zipfile 读到错位数据报 BadZipFile。
+        self._start = start if r.status == 206 else 0
+        if r.status not in (200, 206):
+            raise SourceError(f"WebDAV Range 失败: HTTP {r.status}")
+        if self.pos < self._start:
+            raise SourceError("WebDAV 返回内容起点晚于请求位置")
+        off = self.pos - self._start
+        out = self._buf[off:off+n]
+        self.pos += len(out)
+        return out
+
+
+def _load_webdav_env():
+    """从 .env 读取 WEBDAV_URL/USER/PASS, 不写日志不回显。"""
+    out = {}
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.isfile(path): return out
+    for raw in open(path, encoding="utf-8"):
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line: continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
 
 
 # ------------------------------------------------------------------ 工厂
@@ -754,8 +541,14 @@ def get_source(root):
     with _SOURCES_LOCK:
         src = _SOURCES.get(key)
         if src is None:
-            src = (RcloneSource(root) if is_remote(root)
-                   else LocalSource(root))
+            if is_remote(root):
+                env = _load_webdav_env()
+                if not (env.get("WEBDAV_URL") and env.get("WEBDAV_USER") and env.get("WEBDAV_PASS")):
+                    raise SourceError("远程路径需要 .env 配置 WEBDAV_URL/WEBDAV_USER/WEBDAV_PASS")
+                src = WebDavHttpSource(root, env["WEBDAV_URL"],
+                                       env["WEBDAV_USER"], env["WEBDAV_PASS"])
+            else:
+                src = LocalSource(root)
             _SOURCES[key] = src
         return src
 

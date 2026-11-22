@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """文件操作: 对筛选出的压缩包执行移动/复制。
 
-教训(来自之前的 rclone 教训): 返回码/无异常不代表成功,
+教训(来自之前的远程操作经验): 返回码/无异常不代表成功,
 每个文件操作后都核对目标存在且大小一致才计入成功。
 
 sdcard 上没有 os.rename 跨文件系统的原子性保障,
@@ -355,7 +355,7 @@ def transfer_by_names(db_path, names, dest_dir, mode="copy", log=print,
     """
     if mode not in ("copy", "move"):
         raise ValueError(f"mode 必须是 copy/move: {mode}")
-    remote = source is not None and source.kind == "rclone"
+    remote = source is not None and source.kind == "webdav-http"
 
     def _exists(path):
         if remote:
