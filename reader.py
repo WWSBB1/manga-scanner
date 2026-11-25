@@ -9,6 +9,7 @@
 
 import base64
 import io
+import logging
 import os
 import queue
 import re
@@ -123,16 +124,23 @@ def cache_stats(max_mb):
 
 
 def clear_cache():
+    logging.getLogger("reader").info("MANGA_CACHE_CLEAR_BEGIN")
     with CACHE_LOCK:
         _cache_init()
         conn = sqlite3.connect(CACHE_DB_FILE, timeout=30)
+        removed = 0
         try:
             for (p,) in conn.execute("SELECT path FROM files"):
-                try: os.remove(p)
-                except Exception: pass
+                try:
+                    os.remove(p)
+                    removed += 1
+                except Exception:
+                    pass
             conn.execute("DELETE FROM files"); conn.commit()
         finally:
             conn.close()
+    logging.getLogger("reader").info("MANGA_CACHE_CLEAR_DONE removed=%s", removed)
+    return removed
 
 IMAGE_EXT = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
 _NUM = re.compile(r"(\d+)")
@@ -334,6 +342,7 @@ def _thumb_from(data):
 
 
 def get_thumb(name, size, source=None, root=None, path=None):
+    logging.getLogger("reader").info("THUMB_REQUEST name=%s size=%s", name, size)
     """取缩略图: 缓存命中直接返回; 未命中才从数据源读第一张图并入库。
 
     source/root: 数据源抽象(open_file), 本地与远程共用;
@@ -346,6 +355,7 @@ def get_thumb(name, size, source=None, root=None, path=None):
                 "SELECT data FROM thumbs WHERE name=? AND size=?",
                 (name, size)).fetchone()
             if row:
+                logging.getLogger("reader").info("THUMB_HIT name=%s size=%s", name, size)
                 return bytes(row[0]), "image/jpeg"
         finally:
             conn.close()
@@ -371,7 +381,9 @@ def get_thumb(name, size, source=None, root=None, path=None):
             if data:
                 got = (pages[0], data[0])
     if not got:
+        logging.getLogger("reader").warning("THUMB_MISS_READ name=%s size=%s", name, size)
         return None
+    logging.getLogger("reader").info("THUMB_GENERATE name=%s size=%s", name, size)
     entry, data = got
     thumb = _thumb_from(data)
     if not thumb:
@@ -398,6 +410,17 @@ def thumb_missing(name, size):
                 "SELECT 1 FROM thumbs WHERE name=? AND size=?",
                 (name, size)).fetchone()
             return not row
+        finally:
+            conn.close()
+
+
+def thumb_keys():
+    """返回已有缩略图 (name,size) 集合, 供扫描阶段批量判断。"""
+    with LOCK:
+        conn = _connect()
+        try:
+            return set((r[0], r[1]) for r in conn.execute(
+                "SELECT name,size FROM thumbs"))
         finally:
             conn.close()
 

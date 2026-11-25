@@ -9,6 +9,7 @@
 """
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -19,6 +20,81 @@ from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+
+def _setup_runtime_logging():
+    try:
+        d = os.path.join(BASE, "logs")
+        os.makedirs(d, exist_ok=True)
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+            handlers=[
+                logging.FileHandler(os.path.join(d, "runtime.log"), encoding="utf-8"),
+            ],
+        )
+    except Exception:
+        pass
+
+_setup_runtime_logging()
+
+import sys as _sys
+_sys.excepthook = None
+
+def _excepthook(exc_type, exc, tb):
+    try:
+        logging.getLogger("exception").error(
+            "Uncaught exception", exc_info=(exc_type, exc, tb))
+    except Exception:
+        pass
+    try:
+        sys.__excepthook__(exc_type, exc, tb)
+    except Exception:
+        pass
+
+_sys.excepthook = _excepthook
+
+def _thread_excepthook(args):
+    try:
+        logging.getLogger("thread-exception").error(
+            "Uncaught thread exception: %s", getattr(args, "thread", None),
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+    except Exception:
+        pass
+
+if hasattr(threading, "excepthook"):
+    threading.excepthook = _thread_excepthook
+
+
+def write_op_log(action, detail=None):
+    """记录关键操作到 logs/operations.log。"""
+    try:
+        d = os.path.join(BASE, "logs")
+        os.makedirs(d, exist_ok=True)
+        line = time.strftime("%Y-%m-%d %H:%M:%S") + " " + str(action)
+        if detail:
+            line += " " + json.dumps(detail, ensure_ascii=False, default=str)
+        with open(os.path.join(d, "operations.log"), "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        logging.getLogger("operations").info(line)
+    except Exception:
+        pass
+
+
+def write_api_log(kind, detail=None):
+    """所有 API 请求/响应/错误统一写 logs/api.log。"""
+    try:
+        d = os.path.join(BASE, "logs")
+        os.makedirs(d, exist_ok=True)
+        line = time.strftime("%Y-%m-%d %H:%M:%S") + " " + str(kind)
+        if detail:
+            line += " " + json.dumps(detail, ensure_ascii=False,
+                                     default=str)[:1600]
+        with open(os.path.join(d, "api.log"), "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        logging.getLogger("api").info(line)
+    except Exception:
+        pass
+
 import sys
 sys.path.insert(0, BASE)
 
@@ -97,8 +173,23 @@ class API:
     @staticmethod
     def scan_start(dirs, db, rescan, recursive=True):
         sid = f"scan_{int(time.time())}"
+        log_dir = os.path.join(BASE, "logs", "scan")
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except Exception:
+            pass
+        log_path = os.path.join(log_dir, sid + ".log")
+        try:
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write(f"# scan {sid}\n")
+                f.write(f"# dirs: {dirs}\n")
+                f.write(f"# db: {db}\n")
+                f.write(f"# recursive: {recursive}\n")
+                f.write(f"# rescan: {rescan}\n")
+        except Exception:
+            log_path = None
         SCAN_WORKERS[sid] = {"running": True, "stop": False,
-                             "log": [], "stats": None,
+                             "log": [], "log_path": log_path, "stats": None,
                              # 进度不是日志行: 界面把它渲染成一行固定文字,
                              # 原地刷新。远程每个文件要一两秒, 930 个文件
                              # 如果每行一条日志会滚成瀑布, 反而看不出进度。
@@ -108,6 +199,13 @@ class API:
 
         def log_fn(msg):
             w["log"].append(msg)
+            path = w.get("log_path")
+            if path:
+                try:
+                    with open(path, "a", encoding="utf-8") as f:
+                        f.write(str(msg) + "\n")
+                except Exception:
+                    pass
 
         def progress(done, total, current="", phase=""):
             p = w["progress"]
@@ -124,6 +222,19 @@ class API:
                     progress=progress,
                     stop_flag=lambda: w["stop"], recursive=recursive)
                 w["stats"] = stats
+                path = w.get("log_path")
+                if path:
+                    try:
+                        with open(path, "a", encoding="utf-8") as f:
+                            f.write("STATS " + json.dumps(
+                                {k: v for k, v in (stats or {}).items()
+                                 if k not in ("paths", "names")},
+                                ensure_ascii=False) + "\n")
+                    except Exception:
+                        pass
+                write_op_log("扫描结束", {"scan_id": sid, "stats": {
+                    k: v for k, v in (stats or {}).items()
+                    if k not in ("paths", "names")}})
                 # 记下这次扫到的文件名(连"没扫完就停"的那部分也算),
                 # 浏览页默认只看这批。一起记下是哪个库 —— 扫描页可以填
                 # 别的库, 而浏览页永远读 DB_PATH, 不比对的话会用 A 库的
@@ -148,6 +259,7 @@ class API:
         if not w:
             return {"error": "无效 scan_id"}
         return {"running": w["running"], "log": w["log"],
+                "log_path": w.get("log_path"),
                 "progress": w.get("progress"), "stats": w["stats"]}
 
     @staticmethod
@@ -192,8 +304,21 @@ class API:
             return {"error": str(ex)}
 
     @staticmethod
+    def _reader_rel_path(name):
+        """阅读接口接受安全的相对子路径, 拒绝绝对/越界/反斜杠路径。"""
+        if not name or not isinstance(name, str):
+            return None
+        name = name.strip()
+        if not name or name.startswith(("/", "\\")) or "\\" in name:
+            return None
+        parts = name.split("/")
+        if any(part in ("", ".", "..") for part in parts):
+            return None
+        return name
+
+    @staticmethod
     def reader_list(src_dir, conditions, join="and", scope="scan", limit=200,
-                    force=False):
+                    force=False, subdirs=False):
         """阅读首页: 以目录里的文件为准列出所有可阅读压缩包。
 
         数据库只是元数据缓存: 没入库/没元数据的文件照样显示, 只是字段为空。
@@ -204,25 +329,75 @@ class API:
                 return {"error": "请填有效的漫画目录(本地路径或 WebDAV 远程路径)"}
             with READER_DIR_LOCK:
                 paths = None if force else READER_DIR_CACHE.get(src_dir)
-                if paths is None:
-                    if force:
-                        try: src_layer.drop_source(src_dir)
-                        except Exception: pass
-                    if src_layer.is_remote(src_dir):
-                        source = src_layer.get_source(src_dir)
-                        paths = {}
-                        for rel, name, size, _mtime in source.list_archives(False):
-                            paths[name] = {"path": source.join(rel), "size": size}
-                    else:
-                        paths = {}
-                        for fn in sorted(os.listdir(src_dir)):
-                            full = os.path.join(src_dir, fn)
-                            if os.path.isfile(full) and \
-                                    os.path.splitext(fn)[1].lower() in scanner.ARCHIVE_EXT:
-                                paths[fn] = {"path": full, "size": os.path.getsize(full)}
-                    READER_DIR_CACHE[src_dir] = paths
-                else:
+                if paths is not None:
                     paths = dict(paths)
+                else:
+                    cached = None
+                    if not force:
+                        try:
+                            conn = sqlite3.connect(DB_PATH)
+                            row = conn.execute(
+                                "SELECT files_json FROM dir_listing WHERE root=?",
+                                (src_dir,)).fetchone()
+                            conn.close()
+                            if row and row[0]:
+                                cached = json.loads(row[0])
+                        except Exception:
+                            cached = None
+                    if cached:
+                        paths = {}
+                        for x in cached:
+                            nm = x.get("name")
+                            if not nm: continue
+                            paths[nm] = {"path": nm, "size": x.get("size") or 0}
+                    else:
+                        if force:
+                            try: src_layer.drop_source(src_dir)
+                            except Exception: pass
+                        if src_layer.is_remote(src_dir):
+                            source = src_layer.get_source(src_dir)
+                            paths = {}
+                            for rel, name, size, _mtime in source.list_archives(False):
+                                paths[name] = {"path": rel, "size": size}
+                        else:
+                            paths = {}
+                            for fn in sorted(os.listdir(src_dir)):
+                                full = os.path.join(src_dir, fn)
+                                if os.path.isfile(full) and \
+                                        os.path.splitext(fn)[1].lower() in scanner.ARCHIVE_EXT:
+                                    paths[fn] = {"path": fn, "size": os.path.getsize(full)}
+                    READER_DIR_CACHE[src_dir] = paths
+            if subdirs and not force:
+                # 合并子目录清单: 查所有 root 以当前路径为前缀的缓存行。
+                # paths 的 key 是展示名(字符串), 所以维护独立的 seen 集合按
+                # (文件名,size) 去重, 不能用 tuple 去查字符串 key。
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    prefix = src_dir.rstrip("/") + "/"
+                    rows = conn.execute(
+                        "SELECT root,files_json FROM dir_listing WHERE root LIKE ?",
+                        (prefix + "%",)).fetchall()
+                    conn.close()
+                    # 根目录裸文件名优先保留为显示名; 子目录项只要同名,
+                    # 就用带子目录的 open path 覆盖, 避免按根目录路径打开 404。
+                    for sub_root, fj in rows:
+                        for x in json.loads(fj or "[]"):
+                            nm = x.get("name")
+                            if not nm: continue
+                            sz = int(x.get("size") or 0)
+                            if src_layer.is_remote(sub_root):
+                                sub_rel = sub_root[len(src_dir.rstrip("/")):].lstrip("/")
+                            else:
+                                sub_rel = os.path.relpath(sub_root, src_dir)
+                                if sub_rel == ".": sub_rel = ""
+                            if not sub_rel:
+                                continue
+                            rel = (sub_rel + "/" + nm).lstrip("/")
+                            # 不在列表阶段逐文件 HEAD 检查(会把接口拖死)。
+                            # 子目录清单已经过扫描/清理, 这里直接用它。
+                            paths[nm] = {"path": rel, "size": sz}
+                except Exception:
+                    pass
             if not paths:
                 return {"items": [], "count": 0, "total": 0,
                         "hint": "目录里没有可阅读的漫画压缩包"}
@@ -251,7 +426,9 @@ class API:
             for name in sorted(paths, key=str.lower):
                 info = paths[name]
                 m = meta_by_name.get(name, {})
-                it = {"name": name, "size": info.get("size") or m.get("size") or 0,
+                it = {"name": name,
+                      "open_name": info.get("path") or name,
+                      "size": info.get("size") or m.get("size") or 0,
                       "title": m.get("title") or "",
                       "title_original": m.get("title_original") or "",
                       "artist": m.get("artist") or "", "parody": m.get("parody") or "",
@@ -291,25 +468,12 @@ class API:
 
     @staticmethod
     def reader_pages(name, src_dir, size=0):
+        """打开漫画时直接读 zip 页列表(自然排序), 不依赖数据库页索引。"""
         try:
-            if not src_dir or not name or os.path.dirname(name) \
-                    or name in (".", ".."):
+            rel = API._reader_rel_path(name)
+            if not src_dir or rel is None:
                 return {"error": "参数错误"}
-            # 优先用扫描时存的页索引: 打开漫画不打开 zip、不下载目录。
-            indexed = None
-            try:
-                conn = sqlite3.connect(DB_PATH)
-                row = conn.execute(
-                    "SELECT pages_json FROM reader_zip_index WHERE name=?",
-                    (name,)).fetchone()
-                conn.close()
-                if row and row[0]:
-                    indexed = [p["p"] for p in json.loads(row[0])]
-            except Exception:
-                indexed = None
-            if indexed:
-                return {"name": name, "pages": indexed, "count": len(indexed)}
-            # 没有索引: 打开漫画时按需解析, 成功后存库, 下次直接命中
+            name = rel
             source = src_layer.get_source(src_dir)
             fp = reader.open_manga(source, name, size=size, root=src_dir)
             if not fp:
@@ -317,17 +481,6 @@ class API:
             pages = reader._list_pages_fp(fp)
             if not pages:
                 return {"error": "不是可阅读的 zip, 或里面没有图片"}
-            try:
-                full = reader.zip_entries(fp)
-                conn = sqlite3.connect(DB_PATH)
-                conn.execute("""INSERT INTO reader_zip_index (name,size,pages_json,created)
-                    VALUES (?,?,?,?) ON CONFLICT(name) DO UPDATE SET
-                    size=excluded.size, pages_json=excluded.pages_json,
-                    created=excluded.created""",
-                    (name, int(size or 0), json.dumps(full, ensure_ascii=False), time.time()))
-                conn.commit(); conn.close()
-            except Exception:
-                pass
             return {"name": name, "pages": pages, "count": len(pages)}
         except Exception as ex:
             return {"error": str(ex)}
@@ -358,7 +511,8 @@ class API:
         except (TypeError, ValueError):
             return None
         # 只接受文件名, 不接受带斜杠/..的路径
-        if not name or os.path.dirname(name) or name in (".", ".."):
+        name = API._reader_rel_path(name)
+        if not src_dir or name is None:
             return None
         # 缓存命中: reader.get_thumb 直接查本地缓存, 不碰数据源;
         # 未命中才让数据源(本地/WebDAV)读 zip 第一张图。
@@ -370,8 +524,10 @@ class API:
 
     @staticmethod
     def reader_page_image(name, src_dir, entry, size=0):
-        if not src_dir or not name or os.path.dirname(name) or name in (".", ".."):
+        rel = API._reader_rel_path(name)
+        if not src_dir or rel is None:
             return None
+        name = rel
         try:
             source = src_layer.get_source(src_dir)
             fp = reader.open_manga(source, name, size=size, root=src_dir)
@@ -1028,10 +1184,12 @@ body.rd-open .nav{display:none}
 <div class="card">
   <div class="row">
     <input type="text" id="rd-dir" value="/storage/emulated/0/Download">
-    <button class="outline" onclick="rdRefresh()">刷新</button>
     <button class="outline" onclick="dirHistToggle('rd')" style="flex:0 0 auto;padding:6px 8px">历史</button>
   </div>
   <div id="rd-dir-hist-box" class="rd-hist-pop" style="display:none"></div>
+  <div class="row" style="font-size:13px;align-items:center">
+    <label><input type="checkbox" id="rd-subdirs" onchange="rdSaveOpts();rdLoad()"> 显示子文件夹</label>
+  </div>
   <div class="row">
     <label style="font-size:13px">每行
       <select id="rd-cols" onchange="rdApplyCols()" style="padding:4px">
@@ -1380,7 +1538,11 @@ function showPage(p){
   if(p==='stats')loadStats();
   // 浏览页同理: 进来就按当前范围(默认"本次扫描到的")显示
   if(p==='browse'){loadScopeHint();loadDistinct();doQuery();}
-  if(p==='read'){rdRestoreOpts();rdRenderFavs();dirHistRender('rd');rdLoad();}
+  if(p==='read'){
+    rdRestoreOpts();rdRenderFavs();dirHistRender('rd');
+    const key=rdDir()+'|'+(document.getElementById('rd-subdirs')?.checked?'1':'0');
+    if(!rdLoaded||rdLoadedKey!==key)rdLoad();
+  }
 }
 
 function toggleSettings(){const m=document.getElementById('settings-modal');
@@ -1409,7 +1571,7 @@ const RD_FIELDS={tags:'标签',artist:'作者',group_name:'社团',parody:'原�
   character:'角色',category:'分类',language:'语言',title:'标题'};
 let rdFavs=JSON.parse(localStorage.getItem('manga_rd_favs')||'[]');
 let rdSel=[], rdItems=[], rdView=null, rdPageIdx=0, rdQuickTimer=null, rdHistoryPushed=false, rdDelTimer=null, rdManageFavs=false;
-let rdExpanded=new Set(), rdListPage=0, rdDirTotal=0, rdPageReq=0;
+let rdExpanded=new Set(), rdListPage=0, rdDirTotal=0, rdPageReq=0, rdLoaded=false, rdLoadedKey="";
 const RD_PAGE_SIZE=30;
 function rdSortMode(){const el=document.getElementById('rd-sort');
   const v=el?el.value:(localStorage.getItem('manga_rd_sort')||'date');
@@ -1458,6 +1620,7 @@ function rdRenderGroups(){const grid=document.getElementById('rd-grid');
   grid.classList.remove('rd-grid');grid.style.gridTemplateColumns='';
   grid.classList.add('rd-group-list');
   const groups=rdGroups();
+  const prevSrc=rdCaptureSrc(grid);
   const start=rdListPage*RD_PAGE_SIZE;
   const pageGroups=groups.slice(start,start+RD_PAGE_SIZE);
   grid.innerHTML=pageGroups.map((g,i)=>{
@@ -1465,32 +1628,66 @@ function rdRenderGroups(){const grid=document.getElementById('rd-grid');
     const exp=rdExpanded.has(g.label);
     const cards=g.items.slice(0,10).map(it=>{
       const idx=rdItems.indexOf(it);
+      const open=it.open_name||it.name;
       return '<div class="rd-gcard" onclick="rdOpen('+idx+')">'+
-        '<img alt="" data-name="'+esc(it.name)+'" data-size="'+it.size+'">'+
+        '<img alt="" data-name="'+esc(open)+'" data-size="'+it.size+'"'+rdSrcAttr(prevSrc,open)+'>'+
         '<div class="rd-gname">'+esc(it.title_original||it.title||it.name)+'</div></div>';
     }).join('');
     const rest=exp?'<div class="rd-gexpand">'+g.items.map(it=>{
       const idx=rdItems.indexOf(it);
       return '<div class="rd-card">'+
-        '<img class="rd-thumb" style="cursor:pointer" onclick="rdOpen('+idx+')" alt="" data-name="'+esc(it.name)+'" data-size="'+it.size+'">'+
+        '<img class="rd-thumb" style="cursor:pointer" onclick="rdOpen('+idx+')" alt="" data-name="'+esc(it.open_name||it.name)+'" data-size="'+it.size+'"'+rdSrcAttr(prevSrc,it.open_name||it.name)+'>'+
         '<div class="rd-meta rd-meta-btn" onclick="rdShowDetail('+idx+')">'+
         '<div class="rd-name">'+esc(it.title_original||it.title||it.name)+'</div></div></div>';
     }).join('')+'</div>':'';
-    return '<div class="rd-grow"><div class="rd-glabel" title="'+esc(g.label)+'">'+esc(g.label)+'('+g.items.length+')</div>'+
+    return '<div class="rd-grow" id="rd-group-row-'+gi+'"><div class="rd-glabel" title="'+esc(g.label)+'">'+esc(g.label)+'('+g.items.length+')</div>'+
       '<div class="rd-gstrip">'+cards+'</div>'+
       '<button class="rd-gmore" onclick="rdToggleGroup('+gi+')">'+(exp?'收起':'展开')+'</button></div>'+rest;
   }).join('')||'<div class="rd-loading">没有符合条件的漫画</div>';
   rdFillThumbs(grid);
   rdPager(Math.ceil(groups.length/RD_PAGE_SIZE),
     '共 '+groups.length+' 组 / '+rdItems.length+' 本');}
-function rdToggleGroup(i){const label=rdGroups()[i].label;
-  if(rdExpanded.has(label))rdExpanded.delete(label);else rdExpanded.add(label);
-  rdRenderGroups()}
+function rdToggleGroup(i){
+  const g=rdGroups()[i];
+  if(!g)return;
+  const label=g.label;
+  const row=document.getElementById('rd-group-row-'+i);
+  if(!row){rdRenderGroups();return}
+  const btn=row.querySelector('.rd-gmore');
+  const old=document.getElementById('rd-group-expand-'+i);
+  if(rdExpanded.has(label)){
+    rdExpanded.delete(label);
+    if(old)old.remove();
+    if(btn)btn.textContent='展开';
+    return;
+  }
+  rdExpanded.add(label);
+  if(btn)btn.textContent='收起';
+  if(old){old.style.display='';if(btn)btn.textContent='收起';return}
+  const div=document.createElement('div');
+  div.className='rd-gexpand';div.id='rd-group-expand-'+i;
+  div.innerHTML=g.items.map(it=>{
+    const idx=rdItems.indexOf(it);
+    return '<div class="rd-card">'+
+      '<img class="rd-thumb" style="cursor:pointer" onclick="rdOpen('+idx+')" alt="" data-name="'+esc(it.open_name||it.name)+'" data-size="'+it.size+'">'+
+      '<div class="rd-meta rd-meta-btn" onclick="rdShowDetail('+idx+')">'+
+      '<div class="rd-name">'+esc(it.title_original||it.title||it.name)+'</div></div></div>';
+  }).join('');
+  row.after(div);
+  rdFillThumbs(div);
+}
+function rdCaptureSrc(root){const m={};
+  root.querySelectorAll('img[data-name]').forEach(el=>{
+    const src=el.getAttribute('src');
+    if(src)m[el.dataset.name]=src;
+  });return m}
+function rdSrcAttr(prev,key){return prev&&prev[key]?' src="'+esc(prev[key])+'"':''}
 function rdFillThumbs(root){let k=0;
   const imgs=[...root.querySelectorAll('img[data-name]')];
   function next(){
     if(k>=imgs.length)return;
     const img=imgs[k++];
+    if(img.getAttribute('src'))return next();
     img.src='/api/reader/thumb?'+new URLSearchParams({
       name:img.dataset.name,size:img.dataset.size,src_dir:rdDir()});
     img.onerror=()=>{img.style.background='#f8f8f8'};
@@ -1514,6 +1711,7 @@ function rdSaveOpts(){
   try{
     localStorage.setItem('manga_rd_join',document.getElementById('rd-join').value);
     localStorage.setItem('manga_rd_field',document.getElementById('rd-field').value);
+    localStorage.setItem('manga_rd_subdirs',document.getElementById('rd-subdirs').checked?'1':'0');
   }catch(e){}
   syncDirFromRead();
 }
@@ -1532,6 +1730,7 @@ function rdRestoreOpts(){
   set('rd-view','manga_rd_view','grid');
   set('rd-sort','manga_rd_sort','date');
   set('rd-order','manga_rd_order','desc');
+  const sub=document.getElementById('rd-subdirs');if(sub)sub.checked=localStorage.getItem('manga_rd_subdirs')==='1';
   rdApplyCols();
 }
 const RD_DIR_HIST_KEY='manga_rd_dirs', RD_DIR_HIST_MAX=10;
@@ -1561,7 +1760,7 @@ function dirHistPick(enc){const v=decodeURIComponent(enc);
   document.querySelectorAll('.rd-hist-pop').forEach(e=>e.style.display='none');
   if(!document.getElementById('page-read').classList.contains('hidden'))rdLoad();
 }
-function rdRefresh(){rdSaveOpts();rdDirHistPush(rdDir());rdLoad(true)}
+function rdRefresh(){rdSaveOpts();rdDirHistPush(rdDir());rdLoad()}
 function rdSaveFavs(){localStorage.setItem('manga_rd_favs',JSON.stringify(rdFavs))}
 function rdChipKey(f,v){return f+'\u0001'+v}
 function rdRenderFavs(){
@@ -1681,7 +1880,8 @@ function rdLoad(force){
   if(orderSel)orderSel.value=rdOrder();
   const body={src_dir:rdDir(),conditions:rdConditions(),
     join:document.getElementById('rd-join').value,
-    scope:'all',limit:100000,force:!!force};
+    scope:'all',limit:100000,force:!!force,
+    subdirs:!!document.getElementById('rd-subdirs')?.checked};
   fetch('/api/reader/list',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(body)}).then(r=>r.json()).then(d=>{
       if(d.error||!Array.isArray(d.items)){
@@ -1690,6 +1890,8 @@ function rdLoad(force){
         return;
       }
       rdItems=d.items; rdDirTotal=d.in_dir||0;
+      rdLoaded=true;
+      rdLoadedKey=rdDir()+'|'+(document.getElementById('rd-subdirs')?.checked?'1':'0');
       rdSortItems();
       document.getElementById('rd-count').textContent=
         d.items.length+' / 共 '+d.total+' 本 (目录里 '+d.in_dir+' 本)';
@@ -1711,6 +1913,7 @@ function rdTurn(d){rdListPage+=d;rdExpanded.clear();rdRenderView();
 function rdRenderGrid(){
   rdApplyCols();
   const grid=document.getElementById('rd-grid');
+  const prevSrc=rdCaptureSrc(grid);
   const start=rdListPage*RD_PAGE_SIZE;
   const pageItems=rdItems.slice(start,start+RD_PAGE_SIZE);
   grid.innerHTML=pageItems.map((it,i)=>{
@@ -1718,7 +1921,7 @@ function rdRenderGrid(){
     const sub=it.page_count?('共 '+it.page_count+' 页'):'页数未知';
     const date=it.year?((it.year||'')+'-'+String(it.month||0).padStart(2,'0')+'-'+String(it.day||0).padStart(2,'0')):'';
     return '<div class="rd-card">'+
-      '<img class="rd-thumb" style="cursor:pointer" onclick="rdOpen('+idx+')" loading="lazy" alt="" data-name="'+esc(it.name)+'" data-size="'+it.size+'">' +
+      '<img class="rd-thumb" style="cursor:pointer" onclick="rdOpen('+idx+')" loading="lazy" alt="" data-name="'+esc(it.open_name||it.name)+'" data-size="'+it.size+'"'+rdSrcAttr(prevSrc,it.open_name||it.name)+'>' +
       '<div class="rd-meta rd-meta-btn" onclick="rdShowDetail('+idx+')" title="查看元数据并筛选">'+
       '<div class="rd-name">'+esc(it.title_original||it.title||it.name)+'</div>'+
       '<div class="rd-meta-row"><span>'+esc(sub)+'</span><span class="rd-date">'+esc(date)+'</span></div></div></div>';
@@ -1741,10 +1944,10 @@ function rdOpen(i){
   const opened=rdView;
   // 首帧直接用已缓存的缩略图(后台预热过, 本地秒出), 不等整包下载
   const thumb='/api/reader/thumb?'+new URLSearchParams({
-    name:opened.name,size:opened.size||0,src_dir:rdDir()});
+    name:opened.open_name||opened.name,size:opened.size||0,src_dir:rdDir()});
   document.getElementById('rd-stage').innerHTML=
     '<img src="'+thumb+'" style="max-width:100%;max-height:100%;object-fit:contain">';
-  fetch('/api/reader/pages?'+new URLSearchParams({name:opened.name,src_dir:rdDir(),size:opened.size||0}))
+  fetch('/api/reader/pages?'+new URLSearchParams({name:opened.open_name||opened.name,src_dir:rdDir(),size:opened.size||0}))
     .then(r=>r.json()).then(d=>{
       if(d.error){alert(d.error);rdClose();return;}
       if(rdView!==opened)return;
@@ -1767,7 +1970,7 @@ function rdCycleMode(){
 }
 function rdPageUrl(entry){
   return '/api/reader/page?'+new URLSearchParams({
-    name:rdView.name,src_dir:rdDir(),entry:entry,size:rdView.size||0});
+    name:rdView.open_name||rdView.name,src_dir:rdDir(),entry:entry,size:rdView.size||0});
 }
 function rdRenderPage(){
   if(!rdView)return;
@@ -1780,8 +1983,8 @@ function rdRenderPage(){
   const apply=()=>{
     if(rdPageReq!==seq)return;
     let img=stage.querySelector('img');
-    if(!img||img.dataset.manga!==rdView.name){
-      stage.innerHTML='<img data-manga="'+esc(rdView.name)+'">';
+    if(!img||img.dataset.manga!==(rdView.open_name||rdView.name)){
+      stage.innerHTML='<img data-manga="'+esc(rdView.open_name||rdView.name)+'">';
       img=stage.querySelector('img');
     }
     if(img.getAttribute('src')!==url)img.src=url;
@@ -1794,7 +1997,7 @@ function rdRenderPage(){
     apply();
   }else{
     // 真要等网络: 清掉旧图, 不用旧页冒充新页; 加载好由 apply 填入
-    stage.innerHTML='<img data-manga="'+esc(rdView.name)+'" data-seq="'+seq+'">';
+    stage.innerHTML='<img data-manga="'+esc(rdView.open_name||rdView.name)+'" data-seq="'+seq+'">';
   }
   // 顺手预加载前后各一页(只填浏览器缓存, 不改当前显示)
   [rdPageIdx-1,rdPageIdx+1].forEach(n=>{
@@ -2308,7 +2511,7 @@ function addCond(field,op,value){
   const div=document.createElement('div');
   div.className='cond';div.id='cond-'+id;
   div.innerHTML='<span class="cond-idx">'+(document.getElementById('cls-conds').children.length+1)+'</span>'+
-    '<select class="c-field" onchange="rdLoad()">'+CLS_FIELDS.map(f=>
+    '<select class="c-field" onchange="doQuery()">'+CLS_FIELDS.map(f=>
       '<option value="'+f[0]+'"'+(f[0]===(field||'artist')?' selected':'')+'>'+f[1]+'</option>').join('')+'</select>'+
     '<select class="c-op">'+CLS_OPS.map(o=>
       '<option value="'+o[0]+'"'+(o[0]===(op||'eq')?' selected':'')+'>'+o[1]+'</option>').join('')+'</select>'+
@@ -2732,6 +2935,9 @@ def _attr_escape(s):
 class Handler(BaseHTTPRequestHandler):
     def _json(self, data, code=200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        write_api_log("RESP_JSON", {"path": self.path, "code": code,
+                                    "bytes": len(body),
+                                    "preview": body[:300].decode("utf-8", "replace")})
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -2742,6 +2948,7 @@ class Handler(BaseHTTPRequestHandler):
         # 页面里的路径占位符换成实际值(DB 路径随运行位置变)
         html = html.replace("__DB_PATH__", _attr_escape(DB_PATH))
         body = html.encode("utf-8")
+        write_api_log("RESP_HTML", {"path": self.path, "bytes": len(body)})
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -2749,6 +2956,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _image(self, data, mime, cache=False):
+        write_api_log("RESP_IMAGE", {"path": self.path, "mime": mime,
+                                     "bytes": len(data)})
         self.send_response(200)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(data)))
@@ -2769,6 +2978,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
+        write_api_log("REQ_GET", {"path": path, "query": self.path[:1000]})
 
         if path == "/" or path == "/index.html":
             self._html(HTML_PAGE)
@@ -2818,7 +3028,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/scan/stop":
             sid = qs.get("id", [""])[0]
-            self._json(API.scan_stop(sid))
+            result = API.scan_stop(sid)
+            write_op_log("用户停止扫描", {"scan_id": sid, "result": result})
+            self._json(result)
             return
         if path == "/api/classify/status":
             cid = qs.get("id", [""])[0]
@@ -2887,8 +3099,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = self._read_body()
         except Exception as e:
+            write_api_log("REQ_POST_BAD", {"path": path, "error": str(e)})
             self._json({"error": f"请求体解析失败: {e}"}, 400)
             return
+        write_api_log("REQ_POST", {"path": path, "body": body})
 
         if path == "/api/scan":
             dirs = [d.strip() for d in body.get("dirs", "").split(",") if d.strip()]
@@ -2898,9 +3112,14 @@ class Handler(BaseHTTPRequestHandler):
             if not dirs:
                 self._json({"error": "请填目录"})
                 return
-            self._json(API.scan_start(dirs, db, rescan, recursive))
+            result = API.scan_start(dirs, db, rescan, recursive)
+            write_op_log("开始扫描", {"scan_id": result.get("scan_id"),
+                                    "dirs": dirs, "rescan": rescan,
+                                    "recursive": recursive})
+            self._json(result)
             return
         if path == "/api/classify":
+            write_op_log("开始分类整理", {"names_count": len(body.get("names", []))})
             names = body.get("names", [])
             dest = body.get("dest", "")
             mode = body.get("mode", "copy")
@@ -2944,13 +3163,16 @@ class Handler(BaseHTTPRequestHandler):
                                        body.get("join", "and"),
                                        body.get("scope", "scan"),
                                        body.get("limit", 200),
-                                       force=bool(body.get("force"))))
+                                       force=bool(body.get("force")),
+                                       subdirs=bool(body.get("subdirs"))))
             return
         if path == "/api/cache/clear":
             try:
-                reader.clear_cache()
-                self._json({"ok": True})
+                n = reader.clear_cache()
+                write_op_log("清空阅读缓存", {"removed": n})
+                self._json({"ok": True, "removed": n})
             except Exception as ex:
+                write_op_log("清空阅读缓存失败", {"error": str(ex)})
                 self._json({"error": str(ex)})
             return
         if path == "/api/source":
@@ -2963,11 +3185,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_error(404)
 
+    def send_error(self, code, message=None, explain=None):
+        write_api_log("HTTP_ERROR", {"path": self.path, "code": code,
+                                     "message": str(message or "")})
+        return super().send_error(code, message, explain)
+
     def log_message(self, *args):
-        pass  # 静默
+        try:
+            write_api_log("HTTP_SERVER", {"message": " ".join(str(a) for a in args)})
+        except Exception:
+            pass
 
 
 def main():
+    write_op_log("服务启动", {"pid": os.getpid(), "port": PORT, "db": DB_PATH})
     print(f"漫画管理 APP")
     print(f"数据库: {DB_PATH}")
     print(f"浏览器打开: http://127.0.0.1:{PORT}")

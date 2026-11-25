@@ -22,6 +22,7 @@
 
 import argparse
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -488,6 +489,12 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE INDEX IF NOT EXISTS idx_meta_artist ON meta(artist);
 CREATE INDEX IF NOT EXISTS idx_meta_parody ON meta(parody);
 CREATE INDEX IF NOT EXISTS idx_meta_language ON meta(language);
+CREATE TABLE IF NOT EXISTS dir_listing (
+    root        TEXT PRIMARY KEY,
+    files_json  TEXT NOT NULL,
+    updated_at  REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS reader_zip_index (
     name          TEXT PRIMARY KEY,
     size          INTEGER,
@@ -841,6 +848,52 @@ def _collect_targets(dirs, workers, stop_flag, recursive=True):
     return targets, unsupported
 
 
+def _join_rel(directory, name):
+    """把 PROPFIND 按目录分组后的文件名拼回完整相对路径。"""
+    directory = (directory or "").strip("/")
+    name = (name or "").lstrip("/")
+    return f"{directory}/{name}" if directory else name
+
+
+def prune_dir_listing(db_path, root, seen_child_roots, recursive=None):
+    """删除当前层已消失的文件夹缓存(整棵子树)。
+
+    递归与否都是同一条规则:
+    - 扫描某目录时, PROPFIND/os.scandir 能看到它的直接子文件夹
+    - 缓存里属于该目录但本次没看到的直接子文件夹 => 已消失
+    - 已消失文件夹本身 + 它下面所有子孙目录缓存一起删除
+    - 仍存在的文件夹: 不碰(没递归进去就不能判断内部变化)
+    """
+    prefix = root.rstrip("/") + "/"
+    seen_top = set()
+    for sr in seen_child_roots or []:
+        if not sr or not sr.startswith(prefix):
+            continue
+        seen_top.add(sr[len(prefix):].split("/", 1)[0])
+
+    c = sqlite3.connect(db_path)
+    deleted = 0
+    try:
+        c.execute("""CREATE TABLE IF NOT EXISTS dir_listing (
+            root TEXT PRIMARY KEY,
+            files_json TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )""")
+        rows = c.execute("SELECT root FROM dir_listing").fetchall()
+        for (r,) in rows:
+            if not r or not r.startswith(prefix) or r == root.rstrip("/"):
+                continue
+            rest = r[len(prefix):]
+            top = rest.split("/", 1)[0]
+            if top not in seen_top:
+                c.execute("DELETE FROM dir_listing WHERE root=?", (r,))
+                deleted += 1
+        c.commit()
+    finally:
+        c.close()
+    return deleted
+
+
 # ---------------------------------------------------------------- 主扫描流程
 
 def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
@@ -857,7 +910,13 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
     """
     def emit(msg):
         log(msg)
+        try:
+            logging.getLogger("scan").info(str(msg))
+        except Exception:
+            pass
 
+    emit("扫描开始: dirs=" + repr(dirs) + " db=" + str(db_path) +
+         " recursive=" + str(bool(recursive)) + " rescan=" + str(bool(rescan)))
     # ---- 按数据源分派 -------------------------------------------------
     # 远程和本地都当成"数据源"看, 但**不能混在同一批里扫**:
     # archives.name 是唯一键, 两边出现同名文件时会互相覆盖元数据,
@@ -866,6 +925,7 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
     remote_roots = [d for d in dirs if _source.is_remote(d)]
     local_roots = [d for d in dirs if not _source.is_remote(d)]
     if remote_roots and local_roots:
+        emit("扫描失败: 本地目录与远程路径不能混在同一次扫描里")
         raise ValueError("本地目录与远程路径不能混在同一次扫描里, 请分两次扫")
     for root in local_roots:
         if not os.path.isdir(root):
@@ -878,28 +938,60 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
     items = []
     if remote_roots:
         for root in remote_roots:
-            emit(f"正在拉取远程文件清单: {root} (大目录可能需要几十秒)…")
+            emit(f"开始读取远程路径: {root} (递归={bool(recursive)})")
             if progress:
                 progress(0, 0, "", "拉取远程文件清单")
-            # 扫描必须拿最新清单: get_source 是进程级单例, 缓存可能还是
-            # 上一次扫描时的。不失效的话"再扫一遍"看不到新增文件,
-            # 已删的还当成存在。
             _source.drop_source(root)
             src = _source.get_source(root)
+            walker = getattr(src, "list_dirs", None)
+            if not callable(walker):
+                emit(f"⚠ {root}: 数据源不支持逐目录列举")
+                continue
             try:
-                entries = src.list_archives(recursive=recursive)
+                for drel, files, subdirs in walker(recursive=recursive):
+                    dir_root = _source.join(root, drel).rstrip("/")
+                    # 当前层实际看到的直接子文件夹: 只用来删除消失的缓存,
+                    # 存在的文件夹不写、不更新、不标记。
+                    child_roots = [_source.join(dir_root, sd).rstrip("/")
+                                   for sd in (subdirs or [])]
+                    emit(f"  {dir_root}: 检查目录清单缓存, 当前层子目录 {len(child_roots)} 个")
+                    removed = prune_dir_listing(db_path, dir_root, child_roots)
+                    emit(f"  {dir_root}: 清理失效子目录缓存 {removed} 条")
+                    archives_here = []
+                    for rel, size, mtime in files:
+                        full_rel = _join_rel(drel, rel)
+                        if not full_rel.lower().endswith(ARCHIVE_EXT):
+                            if full_rel.lower().endswith(NOTICE_EXT):
+                                unsupported.append(full_rel)
+                            continue
+                        name = os.path.basename(full_rel)
+                        entry = {"path": _source.join(root, full_rel), "name": name,
+                                 "size": size, "mtime": mtime,
+                                 "src": src, "rel": full_rel}
+                        items.append(entry)
+                        archives_here.append(entry)
+                    # 只有实际读取过这个目录的文件, 才覆盖它的清单缓存。
+                    # 非递归时仅识别到存在的子目录, 不能写空清单把旧数据抹掉。
+                    actually_read = bool(files) or recursive or drel == ""
+                    if actually_read:
+                        listing = [{"name": e["name"], "size": e["size"],
+                                    "mtime": e["mtime"]} for e in archives_here]
+                        emit(f"  {dir_root}: 写入目录清单缓存 {len(listing)} 个")
+                        try:
+                            conn_tmp = open_db(db_path)
+                            conn_tmp.execute("""INSERT INTO dir_listing (root,files_json,updated_at)
+                                VALUES (?,?,?) ON CONFLICT(root) DO UPDATE SET
+                                files_json=excluded.files_json, updated_at=excluded.updated_at""",
+                                (dir_root, json.dumps(listing, ensure_ascii=False), time.time()))
+                            conn_tmp.commit(); conn_tmp.close()
+                            emit(f"  {dir_root}: 目录清单缓存写入完成 {len(listing)} 个")
+                        except Exception as e:
+                            emit(f"  {dir_root}: 目录清单缓存写入失败 {type(e).__name__}: {e}")
+                    else:
+                        emit(f"  {dir_root}: 跳过目录清单写入(非递归仅识别存在, 子目录 {len(subdirs or [])} 个)")
             except _source.SourceError as e:
                 emit(f"⚠ {root}: 读取失败 — {e}")
                 continue
-            emit(f"  {root}: {len(entries)} 个")
-            for rel, name, size, mtime in entries:
-                items.append({"path": _source.join(root, rel), "name": name,
-                              "size": size, "mtime": mtime,
-                              "src": src, "rel": rel})
-            try:
-                unsupported.extend(src.list_notice(recursive=recursive))
-            except _source.SourceError:
-                pass
         w_walk = _source.REMOTE_WORKERS
         emit(f"远程解析: {w_walk} 线程")
     else:
@@ -912,6 +1004,33 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
             items.append({"path": path, "name": os.path.basename(path),
                           "size": None, "mtime": None, "src": None,
                           "rel": None})
+        # 本地也按同一规则: 每个实际扫描到的目录, 只根据当前层子文件夹删失效缓存。
+        checked_dirs = set()
+        for it in items:
+            d = os.path.dirname(it["path"]).rstrip(os.sep)
+            if not d or d in checked_dirs:
+                continue
+            checked_dirs.add(d)
+            try:
+                children = [os.path.abspath(e.path).rstrip(os.sep)
+                            for e in os.scandir(d) if e.is_dir()]
+                emit(f"  {d}: 检查本地目录清单缓存, 当前层子目录 {len(children)} 个")
+                removed = prune_dir_listing(db_path, d, children)
+                emit(f"  {d}: 清理失效子目录缓存 {removed} 条")
+            except OSError as e:
+                emit(f"  {d}: 本地目录检查失败 {type(e).__name__}: {e}")
+        for r in local_roots:
+            d = os.path.abspath(r).rstrip(os.sep)
+            if d in checked_dirs:
+                continue
+            try:
+                children = [os.path.abspath(e.path).rstrip(os.sep)
+                            for e in os.scandir(d) if e.is_dir()]
+                emit(f"  {d}: 检查本地目录清单缓存(根), 当前层子目录 {len(children)} 个")
+                removed = prune_dir_listing(db_path, d, children)
+                emit(f"  {d}: 清理失效子目录缓存(根) {removed} 条")
+            except OSError as e:
+                emit(f"  {d}: 本地根目录检查失败 {type(e).__name__}: {e}")
     emit(f"发现 {len(items)} 个可解析压缩包"
          + (f",另 {len(unsupported)} 个 rar/7z 不解析" if unsupported else "")
          + (" (不含子目录)" if not recursive else "")
@@ -920,6 +1039,41 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
         progress(0, 0, "", "检查增量")
 
     conn = open_db(db_path)
+    # 目录清单缓存: 一次列目录得到完整文件列表, 按路径整体覆盖。
+    try:
+        # 每个实际目录一条清单: 递归扫描时子目录各有自己的 root,
+        # 阅读页才能按前缀查到子文件夹并合并。
+        by_root = {}
+        for it in items:
+            path = it.get("path") or ""
+            if _source.is_remote(path):
+                root = path.rsplit("/", 1)[0] if "/" in path else path
+            else:
+                root = os.path.dirname(path)
+            if not root:
+                continue
+            by_root.setdefault(root, []).append(
+                {"name": it["name"], "size": it.get("size"),
+                 "mtime": it.get("mtime")})
+        # 空目录也要留一条, 否则删空后缓存残留; 远程已逐目录写过, 这里不覆盖
+        for root in local_roots:
+            by_root.setdefault(root, [])
+        emit(f"开始写入本地目录清单缓存: {len(by_root)} 个路径")
+        for root, listing in by_root.items():
+            emit(f"  写入本地目录清单缓存: {root} {len(listing)} 个")
+            try:
+                conn.execute("""INSERT INTO dir_listing (root,files_json,updated_at)
+                    VALUES (?,?,?) ON CONFLICT(root) DO UPDATE SET
+                    files_json=excluded.files_json, updated_at=excluded.updated_at""",
+                    (root, json.dumps(listing, ensure_ascii=False), time.time()))
+                emit(f"  已写入本地目录清单缓存: {root} {len(listing)} 个")
+            except Exception as e:
+                emit(f"  本地目录清单写入失败: {root} {type(e).__name__}: {e}")
+        conn.commit()
+        emit(f"本地目录清单缓存写入完成: {len(by_root)} 个路径")
+    except Exception as e:
+        emit(f"  目录清单写入失败: {type(e).__name__}: {e}")
+    emit("开始检查增量: 按文件名判断, rescan=" + str(bool(rescan)))
     try:
         existing = {} if rescan else load_existing(conn)
         todo, skip_n, skipped_nometa = [], 0, 0
@@ -944,20 +1098,18 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
                         st_size = os.path.getsize(path)
                     except OSError:
                         continue
-                # 只按 name+size 判断, 不比路径, 也不比 mtime。
-                # 本地 mtime 是文件落在本机的时间, 远程 mtime 是云端
-                # ModTime: 同一个文件上传后两边几乎必然不同, 拿它当判据
-                # 会让"本地扫过 -> 上传 -> 扫云端"整批重新解析。
-                # mtime 仍照常入库, 只是不参与增量判断; 内容真被改写
-                # 时若大小没变, 用界面上的「强制重扫」补一次即可。
-                if prev_err is None and prev_size == st_size:
+                # 只按 name 判断, 不比 size/路径/mtime。
+                # 库以 name 为唯一键: 同名文件即使大小不同, 元数据也只保留
+                # 最后处理的那个。拿 size 当判据会导致同名不同大小反复解析、
+                # 反复覆盖; 内容真要更新用「强制重扫」。
+                if prev_err is None:
                     skip_n += 1
                     if not prev_meta:
                         skipped_nometa += 1
                     continue
             todo.append(it)
         emit(f"待处理 {len(todo)},增量跳过 {skip_n}"
-             + (f"(其中 {skipped_nometa} 个解析不出元数据, 大小没变不再重读)"
+             + (f"(其中 {skipped_nometa} 个解析不出元数据, 同名跳过)"
                 if skipped_nometa else ""))
 
         done = fail = nometa = 0
@@ -967,6 +1119,7 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
             n_workers = _source.REMOTE_WORKERS
         else:
             n_workers = workers if workers is not None else worker_count(dirs)
+        emit(f"解析线程: {n_workers}")
         if n_workers > 1:
             emit(f"并行扫描: {n_workers} 线程")
 
@@ -1038,22 +1191,10 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
                     conn.execute("DELETE FROM meta WHERE archive_id=?", (row[0],))
                     conn.execute("DELETE FROM meta_values WHERE archive_id=?",
                                  (row[0],))
-                if it["src"] is None:
-                    emit(f"  ✗ {name[:70]}: {err}")
+                emit(f"  ✗ {name[:70]}: {err}")
             else:
+                emit(f"  ✓ {name[:70]}")
                 save(conn, rec)
-                # 缩略图在扫描阶段补, 阅读页只消费缓存不再触发生成。
-                try:
-                    import reader as _reader
-                    if _reader.thumb_missing(name, it["size"]):
-                        if it["src"] is not None:
-                            _reader.get_thumb(name, it["size"],
-                                              source=it["src"], root=it["path"])
-                        else:
-                            _reader.get_thumb(name, it["size"],
-                                              path=it["path"])
-                except Exception:
-                    pass
                 if not rec["has_meta"]:
                     # 解析成功(能读、没报错)但里面没有元数据文件。
                     # 内容不变就不会再重读 —— 重读结果必然一样。
@@ -1087,7 +1228,7 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
                     consume(item, rec, err, i)
         conn.commit()
         el = time.time() - t0
-        emit(f"完成: 成功 {done}"
+        emit(f"扫描阶段完成: 成功 {done}"
              + (f"(其中 {nometa} 个解析不出元数据)" if nometa else "")
              + f",失败 {fail},跳过 {skip_n},耗时 {el:.1f}s")
         if failures:
@@ -1100,7 +1241,7 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
                 for line, cnt in why.most_common(5):
                     emit(f"  · {line}" + (f"  (共 {cnt} 个)" if cnt > 1 else ""))
                 if len(why) > 5:
-                    emit(f"  · …另有 {len(why) - 5} 种原因未列出")
+                    emit(f"  · …另有 {len(why) - 5} 个失败文件未列出")
         return {"total": len(items), "todo": len(todo), "done": done,
                 "fail": fail, "skip": skip_n,
                 # 解析成功但里面没有元数据文件的个数(它们也在 done 里)

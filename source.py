@@ -27,6 +27,7 @@
 """
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -51,7 +52,7 @@ HTTP_TIMEOUT = HTTP_OP_TIMEOUT      # 兼容旧引用
 # 所以默认 1(串行): 慢但确定性高。想要快点可以调这里, 代价是
 # 更容易撞上限流 —— 撞上了会重试, 重试完仍空则按"服务端限流"报错,
 # 不会伪装成"文件损坏"。
-REMOTE_WORKERS = 1
+REMOTE_WORKERS = 5
 
 # 单次区间读返回空时重试几次。空响应是服务端限流的信号,
 # 退一步再问通常就好了。必须显式判断, 不能把空数据当正常内容 ——
@@ -361,47 +362,99 @@ class WebDavHttpSource(Source):
         r = self._opener.open(req, timeout=HTTP_LIST_TIMEOUT)
         return r.read()
 
-    def list_archives(self, recursive=True):
-        """用 PROPFIND Depth:1/infinity 列出 zip/cbz。返回 (rel,name,size,mtime)。"""
+    def _parse_entries(self, data):
+        """解析 PROPFIND XML, 返回 [(rel,isdir,size,mtime)]。"""
         import xml.etree.ElementTree as ET
-        data = self._xml_body("", "infinity" if recursive else "1")
         root = ET.fromstring(data)
         ns = {"d": "DAV:"}
+        base = (urllib.parse.urlparse(self.url).path.rstrip("/") + "/" +
+                self.base.strip("/")).rstrip("/")
         out = []
         for resp in root.findall("d:response", ns):
             href = resp.findtext("d:href", "", ns)
-            if not href: continue
-            path = urllib.parse.unquote(urllib.parse.urlparse(href).path)
-            base = (urllib.parse.urlparse(self.url).path.rstrip("/") + "/" +
-                    self.base.strip("/")).rstrip("/")
-            rel = path[len(base):].lstrip("/") if path.startswith(base) else path.lstrip("/")
-            isdir = resp.find("d:resourcetype/d:collection", ns) is not None
-            if isdir or not rel.lower().endswith(ARCHIVE_EXT):
+            if not href:
                 continue
+            href_path = urllib.parse.unquote(urllib.parse.urlparse(href).path)
+            rel = href_path[len(base):].lstrip("/") if href_path.startswith(base) else href_path.lstrip("/")
+            # 123 WebDAV 不返回 resourcetype; href 以 / 结尾就是目录。
+            isdir = (resp.find("d:resourcetype/d:collection", ns) is not None
+                     or href_path.endswith("/"))
+            if isdir:
+                rel = rel.strip("/")
             size = int(resp.findtext("d:propstat/d:prop/d:getcontentlength", "0", ns) or 0)
-            lm = resp.findtext("d:propstat/d:prop/d:getlastmodified", "", ns)
-            mtime = _parse_modtime(lm)
-            out.append((rel, os.path.basename(rel), size, mtime))
+            mtime = _parse_modtime(resp.findtext("d:propstat/d:prop/d:getlastmodified", "", ns))
+            out.append((rel, isdir, size, mtime))
+        return out
+
+    def _walk(self, rel="", recursive=True):
+        """逐目录产出 (目录rel, 文件列表, 子目录列表)。
+
+        - 非递归: 只 PROPFIND 当前目录, 只 yield 当前目录;
+          识别到的子目录放进 subdirs 给上层保留缓存, 但不进入、不写空清单。
+        - 递归: 逐个子目录继续处理, 每层只 yield 一次。
+        """
+        import posixpath
+        data = self._xml_body(rel, "1")
+        entries = self._parse_entries(data)
+        base_rel = (rel or "").strip("/")
+        files_by_dir = {}
+        children = set()
+
+        for path, isdir, size, mtime in entries:
+            path = (path or "").strip("/")
+            if not path or path == base_rel or path.startswith("../"):
+                continue
+            parent = posixpath.dirname(path)
+            if isdir:
+                # 只把当前目录的直接子目录算作 children
+                if parent == base_rel:
+                    children.add(path)
+                continue
+            # PROPFIND 可能把子目录里的文件折叠返回。
+            if parent == base_rel:
+                files_by_dir.setdefault(base_rel, []).append(
+                    (posixpath.basename(path), size, mtime))
+            else:
+                # 从折叠 href 里得知的子目录存在; 递归时继续处理,
+                # 非递归时只记为子目录存在, 不进去。
+                top = path[len(base_rel) + 1:].split("/")[0] if base_rel else path.split("/")[0]
+                child = f"{base_rel}/{top}" if base_rel else top
+                children.add(child)
+                if recursive:
+                    files_by_dir.setdefault(parent, []).append(
+                        (posixpath.basename(path), size, mtime))
+
+        child_dirs = sorted(children)
+        yield base_rel, files_by_dir.get(base_rel, []), child_dirs
+        if not recursive:
+            return
+        seen = set()
+        for d in sorted(set(child_dirs) | set(files_by_dir)):
+            if not d or d == base_rel or d in seen:
+                continue
+            seen.add(d)
+            yield from self._walk(d, recursive)
+
+    def list_dirs(self, recursive=True):
+        """逐目录产出: (目录rel, 文件列表, 子目录列表)。"""
+        return self._walk("", recursive)
+
+    def list_archives(self, recursive=True):
+        """兼容旧调用: 仍返回完整 zip/cbz 列表。"""
+        out = []
+        for _dir, files, _subdirs in self._walk("", recursive):
+            for path, size, mtime in files:
+                if path.lower().endswith(ARCHIVE_EXT):
+                    out.append((path, os.path.basename(path), size, mtime))
         return out
 
     def list_notice(self, recursive=True):
-        """列出不支持解析但需提示的压缩包(rar/7z)。"""
-        import xml.etree.ElementTree as ET
-        data = self._xml_body("", "infinity" if recursive else "1")
-        root = ET.fromstring(data)
-        ns = {"d": "DAV:"}
+        """兼容旧调用: 列出 rar/7z。"""
         out = []
-        for resp in root.findall("d:response", ns):
-            href = resp.findtext("d:href", "", ns)
-            if not href: continue
-            path = urllib.parse.unquote(urllib.parse.urlparse(href).path)
-            base = (urllib.parse.urlparse(self.url).path.rstrip("/") + "/" +
-                    self.base.strip("/")).rstrip("/")
-            rel = path[len(base):].lstrip("/") if path.startswith(base) else path.lstrip("/")
-            isdir = resp.find("d:resourcetype/d:collection", ns) is not None
-            if isdir or not rel.lower().endswith(NOTICE_EXT):
-                continue
-            out.append(rel)
+        for _dir, files, _subdirs in self._walk("", recursive):
+            for path, _s, _m in files:
+                if path.lower().endswith(NOTICE_EXT):
+                    out.append(path)
         return out
 
     def exists(self, rel):
@@ -424,7 +477,10 @@ class WebDavHttpSource(Source):
 
     def move(self, src_rel, dst_rel):
         # WebDAV MOVE, 不覆盖已有目标
-        if self.exists(dst_rel): return "skip", "目标已存在, 不覆盖"
+        logging.getLogger("source").info("WEBDAV_MOVE src=%s dst=%s", src_rel, dst_rel)
+        if self.exists(dst_rel):
+            logging.getLogger("source").info("WEBDAV_MOVE_SKIP dst=%s", dst_rel)
+            return "skip", "目标已存在, 不覆盖"
         req = urllib.request.Request(self._full_url(src_rel), headers={
             "Authorization": self._auth, "Destination": self._full_url(dst_rel),
             "Overwrite": "F"}, method="MOVE")
@@ -432,13 +488,29 @@ class WebDavHttpSource(Source):
             r = self._opener.open(req, timeout=HTTP_OP_TIMEOUT)
             return "ok", f"HTTP {r.status}"
         except Exception as e:
+            logging.getLogger("source").error("WEBDAV_MOVE_FAIL src=%s dst=%s err=%s",
+                                              src_rel, dst_rel, e)
             return "fail", str(e)[:200]
 
     def copy(self, src_rel, dst_rel):
-        if self.exists(dst_rel): return "skip", "目标已存在, 不覆盖"
+        logging.getLogger("source").info("WEBDAV_COPY src=%s dst=%s", src_rel, dst_rel)
+        if self.exists(dst_rel):
+            logging.getLogger("source").info("WEBDAV_COPY_SKIP dst=%s", dst_rel)
+            return "skip", "目标已存在, 不覆盖"
         req = urllib.request.Request(self._full_url(src_rel), headers={
             "Authorization": self._auth, "Destination": self._full_url(dst_rel),
             "Overwrite": "F"}, method="COPY")
+        try:
+            r = self._opener.open(req, timeout=HTTP_OP_TIMEOUT)
+            return "ok", f"HTTP {r.status}"
+        except Exception as e:
+            return "fail", str(e)[:200]
+
+    def delete(self, rel):
+        """删除远程文件(WebDAV DELETE)。"""
+        logging.getLogger("source").info("WEBDAV_DELETE rel=%s", rel)
+        req = urllib.request.Request(self._full_url(rel),
+            headers={"Authorization": self._auth}, method="DELETE")
         try:
             r = self._opener.open(req, timeout=HTTP_OP_TIMEOUT)
             return "ok", f"HTTP {r.status}"
