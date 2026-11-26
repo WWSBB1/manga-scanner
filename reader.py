@@ -3,12 +3,13 @@
 
 缩略图存在项目目录下独立的 SQLite 库里(不是散落的图片文件):
 - 不会出现在 Android 相册/媒体扫描里
-- 按 (文件名, 大小) 索引, 与原库共用的"名字+大小"口径一致
+- 按文件名索引: 同名漫画无论 size 或所在子目录变化, 都复用同一张缩略图
 - 每个缩略图压到几十 KB, 单条 BLOB 直接由 HTTP 返回
 """
 
 import base64
 import io
+import json
 import logging
 import os
 import queue
@@ -29,20 +30,56 @@ LOCK = threading.Lock()
 LOCAL_TASK_QUEUE = queue.Queue()
 REMOTE_TASK_QUEUE = queue.Queue()
 
-# 远程漫画整包缓存: key=(root, name, size), value=bytes。
-# 实测 10MB 整包约 2 秒, 之后每页本地读 0.01 秒; Range 逐页读第 2/3 页
-# 因 WebDAV 限流会到 10 秒以上, 所以远程打开时一次性拉全。
-# 远程 zip 会话缓存: key=(root, name, size), value={"fp":RemoteFile,"names":[...],"offsets":...}
-# 只读一次中央目录, 之后翻页按 offset 直接 Range 读取, 不下载整包。
+# 远程 zip 会话缓存: key=(root, name), value={"fp":BytesIO,"zf":ZipFile,"names":[...]}
+# 只读一次中央目录, 之后翻页按 offset 直接内存读取。
 MANGA_SESSIONS = {}
 MANGA_SESSION_LOCK = threading.Lock()
 MANGA_SESSION_MAX = 4
 
-# 远程漫画磁盘缓存: 整包缓存, 总大小默认上限 500MB, LRU 清理。
+# 远程漫画磁盘缓存: 整包缓存, 总大小上限可配置, LRU 清理。
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "manga_cache")
 CACHE_DB_FILE = os.path.join(CACHE_DIR, "index.db")
+CACHE_CONFIG_FILE = os.path.join(CACHE_DIR, "config.json")
 CACHE_DEFAULT_MAX_MB = 500
 CACHE_LOCK = threading.Lock()
+
+
+def _clamp_max_mb(value):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return CACHE_DEFAULT_MAX_MB
+    return max(50, min(5000, n))
+
+
+def _read_max_mb():
+    try:
+        with open(CACHE_CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return _clamp_max_mb(data.get("max_mb"))
+    except Exception:
+        return CACHE_DEFAULT_MAX_MB
+
+
+def _write_max_mb(value):
+    n = _clamp_max_mb(value)
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    tmp = CACHE_CONFIG_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"max_mb": n}, f)
+    os.replace(tmp, CACHE_CONFIG_FILE)
+    return n
+
+
+def set_cache_max(max_mb):
+    """保存页面设置的上限; 后端缓存淘汰实际使用这个值。"""
+    n = _write_max_mb(max_mb)
+    logging.getLogger("reader").info("MANGA_CACHE_MAX_SET max_mb=%s", n)
+    return n
+
+
+def get_cache_max():
+    return _read_max_mb()
 
 
 def _cache_init():
@@ -57,9 +94,43 @@ def _cache_init():
     conn.commit(); conn.close()
 
 
-def _cache_key(root, name, size):
-    import hashlib
-    return hashlib.sha1(f"{root}|{name}|{size}".encode()).hexdigest()
+def _cache_key(root, name):
+    """缓存索引 key: 直接用源文件名(basename), 不带相对路径, 不用哈希, 不用大小。"""
+    return (name or "").replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+
+
+_INVALID_CACHE_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _cache_filename(name):
+    """磁盘缓存文件名: 只取源文件名, 平铺在 manga_cache 根目录。"""
+    base = str(name or "").replace("\\", "/").rstrip("/")
+    leaf = os.path.basename(base)
+    leaf = _INVALID_CACHE_FILENAME.sub("_", leaf).strip().strip(".")
+    if not leaf:
+        leaf = "manga.zip"
+    elif not leaf.lower().endswith(".zip"):
+        leaf += ".zip"
+    return leaf
+
+def _unique_cache_path(conn, key, name):
+    """生成缓存路径; 同名冲突只加 (2)/(3), 不用哈希。"""
+    rel = _cache_filename(name)
+    dest = os.path.join(CACHE_DIR, rel)
+    taken = conn.execute(
+        "SELECT key FROM files WHERE path=? AND key<>?", (dest, key)).fetchone()
+    if not taken:
+        return dest
+    stem, ext = os.path.splitext(rel)
+    n = 2
+    while True:
+        rel_n = f"{stem} ({n}){ext}"
+        dest = os.path.join(CACHE_DIR, rel_n)
+        taken = conn.execute(
+            "SELECT key FROM files WHERE path=? AND key<>?", (dest, key)).fetchone()
+        if not taken:
+            return dest
+        n += 1
 
 
 def _cache_get(key):
@@ -81,16 +152,18 @@ def _cache_get(key):
     return None
 
 
-def _cache_put(key, data, max_mb):
+def _cache_put(key, data, max_mb, name=None):
     """写入缓存文件并登记; 超限按 last_used 从旧到新删除。"""
     with CACHE_LOCK:
         _cache_init()
-        dest = os.path.join(CACHE_DIR, key + ".zip")
-        tmp = dest + ".part"
-        with open(tmp, "wb") as f: f.write(data)
-        os.replace(tmp, dest)
         conn = sqlite3.connect(CACHE_DB_FILE, timeout=30)
         try:
+            old = conn.execute("SELECT path FROM files WHERE key=?", (key,)).fetchone()
+            dest = old[0] if old and os.path.isfile(old[0]) else \
+                _unique_cache_path(conn, key, name or key)
+            tmp = dest + ".part"
+            with open(tmp, "wb") as f: f.write(data)
+            os.replace(tmp, dest)
             conn.execute("INSERT OR REPLACE INTO files (key,path,size,last_used) VALUES (?,?,?,?)",
                          (key, dest, len(data), time.time()))
             conn.commit()
@@ -110,15 +183,16 @@ def _cache_put(key, data, max_mb):
     return dest
 
 
-def cache_stats(max_mb):
+def cache_stats(max_mb=None):
     """返回缓存统计: 文件数、总字节、上限。"""
+    limit_mb = _clamp_max_mb(max_mb if max_mb is not None else _read_max_mb())
     with CACHE_LOCK:
         _cache_init()
         conn = sqlite3.connect(CACHE_DB_FILE, timeout=30)
         try:
             n, total = conn.execute(
                 "SELECT COUNT(*), COALESCE(SUM(size),0) FROM files").fetchone()
-            return {"count": n, "bytes": total, "max_mb": int(max_mb)}
+            return {"count": n, "bytes": total, "max_mb": limit_mb}
         finally:
             conn.close()
 
@@ -152,19 +226,61 @@ def _natural_key(name):
                  for p in parts)
 
 
+def _thumb_name(name):
+    """缩略图只按文件名索引, 去掉可能带上的子目录前缀。"""
+    return name.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+
+
 def _connect():
     conn = sqlite3.connect(CACHE_DB, timeout=30)
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("""CREATE TABLE IF NOT EXISTS thumbs (
-        name TEXT NOT NULL,
+        name TEXT PRIMARY KEY,
         size INTEGER NOT NULL,
         entry TEXT NOT NULL,
         mime TEXT NOT NULL,
         data BLOB NOT NULL,
-        created REAL NOT NULL,
-        PRIMARY KEY (name, size)
+        created REAL NOT NULL
     )""")
+    _migrate_thumbs(conn)
     return conn
+
+
+def _migrate_thumbs(conn):
+    """旧库按 (name,size) 存, 迁移成按文件名唯一。
+
+    同名记录保留 created 最新的一条; 带目录前缀的记录折算成文件名。
+    size 只作为普通属性保存, 不用来选择/判断文件。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(thumbs)")}
+    if "data" not in cols:
+        return
+    if {"name", "size"}.issubset(cols):
+        pk = [r[1] for r in conn.execute("PRAGMA table_info(thumbs)")
+              if r[5]]
+        if pk == ["name"]:
+            return
+        rows = conn.execute(
+            "SELECT name,size,entry,mime,data,created FROM thumbs").fetchall()
+        best = {}
+        for name, size, entry, mime, data, created in rows:
+            base = _thumb_name(name)
+            old = best.get(base)
+            if old is None or (created or 0) >= (old[5] or 0):
+                best[base] = (base, size or 0, entry, mime, data, created)
+        conn.execute("DROP TABLE thumbs")
+        conn.execute("""CREATE TABLE thumbs (
+            name TEXT PRIMARY KEY,
+            size INTEGER NOT NULL,
+            entry TEXT NOT NULL,
+            mime TEXT NOT NULL,
+            data BLOB NOT NULL,
+            created REAL NOT NULL
+        )""")
+        conn.executemany(
+            "INSERT INTO thumbs (name,size,entry,mime,data,created) "
+            "VALUES (?,?,?,?,?,?)", best.values())
+        conn.commit()
 
 
 def _image_names(z):
@@ -342,20 +458,19 @@ def _thumb_from(data):
 
 
 def get_thumb(name, size, source=None, root=None, path=None):
-    logging.getLogger("reader").info("THUMB_REQUEST name=%s size=%s", name, size)
-    """取缩略图: 缓存命中直接返回; 未命中才从数据源读第一张图并入库。
+    """取缩略图: 按文件名命中缓存; 未命中才从数据源读第一张图并入库。
 
-    source/root: 数据源抽象(open_file), 本地与远程共用;
-    path: 兼容旧的本地文件路径调用。
+    name/path 保留完整相对路径给数据源打开; key 只用于本地缩略图缓存。
     """
+    key = _thumb_name(name)
+    logging.getLogger("reader").info("THUMB_REQUEST name=%s size=%s", key, size)
     with LOCK:
         conn = _connect()
         try:
             row = conn.execute(
-                "SELECT data FROM thumbs WHERE name=? AND size=?",
-                (name, size)).fetchone()
+                "SELECT data FROM thumbs WHERE name=?", (key,)).fetchone()
             if row:
-                logging.getLogger("reader").info("THUMB_HIT name=%s size=%s", name, size)
+                logging.getLogger("reader").info("THUMB_HIT name=%s size=%s", key, size)
                 return bytes(row[0]), "image/jpeg"
         finally:
             conn.close()
@@ -381,9 +496,9 @@ def get_thumb(name, size, source=None, root=None, path=None):
             if data:
                 got = (pages[0], data[0])
     if not got:
-        logging.getLogger("reader").warning("THUMB_MISS_READ name=%s size=%s", name, size)
+        logging.getLogger("reader").warning("THUMB_MISS_READ name=%s size=%s", key, size)
         return None
-    logging.getLogger("reader").info("THUMB_GENERATE name=%s size=%s", name, size)
+    logging.getLogger("reader").info("THUMB_GENERATE name=%s size=%s", key, size)
     entry, data = got
     thumb = _thumb_from(data)
     if not thumb:
@@ -394,7 +509,7 @@ def get_thumb(name, size, source=None, root=None, path=None):
             conn.execute(
                 "INSERT OR REPLACE INTO thumbs "
                 "(name,size,entry,mime,data,created) VALUES (?,?,?,?,?,?)",
-                (name, size, entry, "image/jpeg", thumb, time.time()))
+                (key, size, entry, "image/jpeg", thumb, time.time()))
             conn.commit()
         finally:
             conn.close()
@@ -402,25 +517,24 @@ def get_thumb(name, size, source=None, root=None, path=None):
 
 
 def thumb_missing(name, size):
-    """缓存里没有这个 (文件名, 大小) 的缩略图就返回 True。"""
+    """缓存里没有这个文件名(忽略 size)的缩略图就返回 True。"""
+    name = _thumb_name(name)
     with LOCK:
         conn = _connect()
         try:
             row = conn.execute(
-                "SELECT 1 FROM thumbs WHERE name=? AND size=?",
-                (name, size)).fetchone()
+                "SELECT 1 FROM thumbs WHERE name=?", (name,)).fetchone()
             return not row
         finally:
             conn.close()
 
 
 def thumb_keys():
-    """返回已有缩略图 (name,size) 集合, 供扫描阶段批量判断。"""
+    """返回已有缩略图文件名集合, 供扫描阶段批量判断。"""
     with LOCK:
         conn = _connect()
         try:
-            return set((r[0], r[1]) for r in conn.execute(
-                "SELECT name,size FROM thumbs"))
+            return set(r[0] for r in conn.execute("SELECT name FROM thumbs"))
         finally:
             conn.close()
 
@@ -430,7 +544,14 @@ def _warm_worker(task_queue):
     import source as src_layer
     srcs = {}
     while True:
-        root, name, size = task_queue.get()
+        queued = task_queue.get()
+        if isinstance(queued, tuple) and len(queued) == 2:
+            (root, name), size = queued
+        elif isinstance(queued, tuple) and len(queued) == 3 and \
+                isinstance(queued[0], tuple):
+            (root, name), size = queued[0], queued[2]
+        else:
+            root, name, size = queued
         try:
             if root not in srcs:
                 srcs[root] = src_layer.get_source(root)
@@ -439,7 +560,7 @@ def _warm_worker(task_queue):
             pass
         finally:
             with _WARM_PENDING_LOCK:
-                _WARM_PENDING.discard((root, name, size))
+                _WARM_PENDING.discard((root, name))
             task_queue.task_done()
 
 
@@ -450,26 +571,25 @@ _WARM_PENDING_LOCK = threading.Lock()
 def thumb_warm(root, items):
     """把缺缓存的缩略图排进后台队列: items = [(name, size), ...]。
 
-    一次 SELECT 取出所有已缓存的 (name,size) 在内存对比, 逐本查库会拖慢列表。
+    一次 SELECT 取出所有已缓存的文件名, 在内存对比; size 不作为身份判断。
     _WARM_PENDING 防止后台还没生成完时重复排队。
     """
     import source as src_layer
     with LOCK:
         conn = _connect()
         try:
-            have = set((r[0], r[1]) for r in conn.execute(
-                "SELECT name, size FROM thumbs"))
+            have = set(r[0] for r in conn.execute("SELECT name FROM thumbs"))
         finally:
             conn.close()
     q = REMOTE_TASK_QUEUE if src_layer.is_remote(root) else LOCAL_TASK_QUEUE
     n = 0
     for name, size in items:
-        key = (root, name, size)
+        key = (root, name)
         with _WARM_PENDING_LOCK:
-            if key in _WARM_PENDING or (name, size) in have:
+            if key in _WARM_PENDING or name in have:
                 continue
             _WARM_PENDING.add(key)
-        q.put(key)
+        q.put((key, name, size))
         n += 1
     return n
 
@@ -484,11 +604,11 @@ def open_manga(source, name, size=0, root=""):
         return None
     if hasattr(source, "open_path") and getattr(source, "kind", "") == "webdav-http":
         sz = int(size or 0)
-        key = (root, name, sz)
+        key = (root, name)
         with MANGA_SESSION_LOCK:
             hit = MANGA_SESSIONS.get(key)
             if hit is None:
-                ck = _cache_key(root, name, sz)
+                ck = _cache_key(root, name)
                 cached = _cache_get(ck)
                 if cached:
                     with open(cached, "rb") as f: data = f.read()
@@ -499,7 +619,7 @@ def open_manga(source, name, size=0, root=""):
                         try: fp.close()
                         except Exception: pass
                     if not data: return None
-                    try: _cache_put(ck, data, CACHE_DEFAULT_MAX_MB)
+                    try: _cache_put(ck, data, _read_max_mb(), name)
                     except Exception: pass
                 zf = zipfile.ZipFile(io.BytesIO(data))
                 names = _image_names(zf)

@@ -369,8 +369,8 @@ class API:
                     READER_DIR_CACHE[src_dir] = paths
             if subdirs and not force:
                 # 合并子目录清单: 查所有 root 以当前路径为前缀的缓存行。
-                # paths 的 key 是展示名(字符串), 所以维护独立的 seen 集合按
-                # (文件名,size) 去重, 不能用 tuple 去查字符串 key。
+                # paths 的 key 是展示名(字符串), 同名文件按文件名去重;
+                # size 只是属性, 不参与判断。
                 try:
                     conn = sqlite3.connect(DB_PATH)
                     prefix = src_dir.rstrip("/") + "/"
@@ -1557,8 +1557,13 @@ function toggleSettings(){const m=document.getElementById('settings-modal');
 }
 // ---- 阅读缓存设置 ----
 function rdCacheMax(){const v=parseInt(document.getElementById('rd-cache-max')?.value)||500;return v}
-function rdSaveCacheMax(){try{localStorage.setItem('manga_cache_max_mb',String(rdCacheMax()))}catch(e){}
-  rdLoadCacheStats();}
+function rdSaveCacheMax(){
+  const mb=rdCacheMax();
+  try{localStorage.setItem('manga_cache_max_mb',String(mb))}catch(e){}
+  fetch('/api/cache/max',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({max_mb:mb})})
+    .then(r=>r.json()).then(()=>rdLoadCacheStats());
+}
 function rdClearCache(){fetch('/api/cache/clear',{method:'POST'}).then(r=>r.json()).then(d=>{
   if(d.ok){rdLoadCacheStats();alert('缓存已清空')}})}
 function rdLoadCacheStats(){fetch('/api/cache/stats?max_mb='+rdCacheMax()).then(r=>r.json()).then(d=>{
@@ -1621,6 +1626,7 @@ function rdRenderGroups(){const grid=document.getElementById('rd-grid');
   grid.classList.add('rd-group-list');
   const groups=rdGroups();
   const prevSrc=rdCaptureSrc(grid);
+  const openSet={};
   const start=rdListPage*RD_PAGE_SIZE;
   const pageGroups=groups.slice(start,start+RD_PAGE_SIZE);
   grid.innerHTML=pageGroups.map((g,i)=>{
@@ -1629,14 +1635,17 @@ function rdRenderGroups(){const grid=document.getElementById('rd-grid');
     const cards=g.items.slice(0,10).map(it=>{
       const idx=rdItems.indexOf(it);
       const open=it.open_name||it.name;
+      const src=rdSrcAttr(prevSrc,open);
+      if(src)openSet[open]=src;
       return '<div class="rd-gcard" onclick="rdOpen('+idx+')">'+
-        '<img alt="" data-name="'+esc(open)+'" data-size="'+it.size+'"'+rdSrcAttr(prevSrc,open)+'>'+
+        '<img alt="" data-name="'+esc(open)+'" data-size="'+it.size+'"'+src+'>'+
         '<div class="rd-gname">'+esc(it.title_original||it.title||it.name)+'</div></div>';
     }).join('');
     const rest=exp?'<div class="rd-gexpand">'+g.items.map(it=>{
       const idx=rdItems.indexOf(it);
+      const open=it.open_name||it.name;
       return '<div class="rd-card">'+
-        '<img class="rd-thumb" style="cursor:pointer" onclick="rdOpen('+idx+')" alt="" data-name="'+esc(it.open_name||it.name)+'" data-size="'+it.size+'"'+rdSrcAttr(prevSrc,it.open_name||it.name)+'>'+
+        '<img class="rd-thumb" style="cursor:pointer" onclick="rdOpen('+idx+')" alt="" data-name="'+esc(open)+'" data-size="'+it.size+'"'+rdSrcAttr(openSet,open)+'>'+
         '<div class="rd-meta rd-meta-btn" onclick="rdShowDetail('+idx+')">'+
         '<div class="rd-name">'+esc(it.title_original||it.title||it.name)+'</div></div></div>';
     }).join('')+'</div>':'';
@@ -1666,10 +1675,12 @@ function rdToggleGroup(i){
   if(old){old.style.display='';if(btn)btn.textContent='收起';return}
   const div=document.createElement('div');
   div.className='rd-gexpand';div.id='rd-group-expand-'+i;
+  const prevSrc=rdCaptureSrc(document.getElementById('rd-grid'));
   div.innerHTML=g.items.map(it=>{
     const idx=rdItems.indexOf(it);
+    const open=it.open_name||it.name;
     return '<div class="rd-card">'+
-      '<img class="rd-thumb" style="cursor:pointer" onclick="rdOpen('+idx+')" alt="" data-name="'+esc(it.open_name||it.name)+'" data-size="'+it.size+'">'+
+      '<img class="rd-thumb" style="cursor:pointer" onclick="rdOpen('+idx+')" alt="" data-name="'+esc(open)+'" data-size="'+it.size+'"'+rdSrcAttr(prevSrc,open)+'>'+
       '<div class="rd-meta rd-meta-btn" onclick="rdShowDetail('+idx+')">'+
       '<div class="rd-name">'+esc(it.title_original||it.title||it.name)+'</div></div></div>';
   }).join('');
@@ -3004,7 +3015,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/cache/stats":
             try:
                 self._json(reader.cache_stats(
-                    int(qs.get("max_mb", [str(reader.CACHE_DEFAULT_MAX_MB)])[0])))
+                    int(qs.get("max_mb", [str(reader.get_cache_max())])[0])))
             except Exception as ex:
                 self._json({"error": str(ex)})
             return
@@ -3165,6 +3176,15 @@ class Handler(BaseHTTPRequestHandler):
                                        body.get("limit", 200),
                                        force=bool(body.get("force")),
                                        subdirs=bool(body.get("subdirs"))))
+            return
+        if path == "/api/cache/max":
+            try:
+                mb = reader.set_cache_max(body.get("max_mb"))
+                write_op_log("设置阅读缓存上限", {"max_mb": mb})
+                self._json({"ok": True, "max_mb": mb})
+            except Exception as ex:
+                write_op_log("设置阅读缓存上限失败", {"error": str(ex)})
+                self._json({"error": str(ex)})
             return
         if path == "/api/cache/clear":
             try:

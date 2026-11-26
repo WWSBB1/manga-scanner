@@ -11,8 +11,8 @@
     metadata.json   其它下载器,标签列表在顶层
 
 增量规则:
-    - 上次成功且文件 name+size 未变 -> 跳过(不比 mtime)
-    - 读过但没解析出元数据 -> size 不变也跳过(重读结果必然一样)
+    - 上次成功且文件名已存在 -> 跳过(不比 size、不比 mtime)
+    - 读过但没解析出元数据 -> 也跳过(重读结果不会变)
     - 上次报错 -> 下次重试
     - 同名不同目录 -> 告警跳过,不覆盖
 
@@ -495,13 +495,6 @@ CREATE TABLE IF NOT EXISTS dir_listing (
     updated_at  REAL NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS reader_zip_index (
-    name          TEXT PRIMARY KEY,
-    size          INTEGER,
-    pages_json    TEXT NOT NULL,
-    created       REAL NOT NULL
-);
-
 CREATE INDEX IF NOT EXISTS idx_archives_has_meta ON archives(has_meta);
 
 CREATE TABLE IF NOT EXISTS meta_values (
@@ -537,38 +530,8 @@ def open_db(path=DEFAULT_DB):
     conn.executescript(SCHEMA)
     migrate_drop_path(conn)
     migrate_meta_values(conn)
-    migrate_reader_zip_index(conn)
     conn.commit()
     return conn
-
-
-def migrate_reader_zip_index(conn):
-    """老库迁移: reader_zip_index 改为按文件名唯一, size 只作属性。"""
-    try:
-        sql = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' "
-            "AND name='reader_zip_index'").fetchone()
-        if not sql or not sql[0]:
-            return False
-        if "PRIMARY KEY (name, size)" not in sql[0] and \
-                "PRIMARY KEY(name, size)" not in sql[0]:
-            return False
-        rows = conn.execute(
-            "SELECT name, MAX(size), MAX(pages_json), MAX(created) "
-            "FROM reader_zip_index GROUP BY name").fetchall()
-        conn.execute("DROP TABLE reader_zip_index")
-        conn.execute("""CREATE TABLE reader_zip_index (
-            name TEXT PRIMARY KEY,
-            size INTEGER,
-            pages_json TEXT NOT NULL,
-            created REAL NOT NULL
-        )""")
-        conn.executemany(
-            "INSERT INTO reader_zip_index (name,size,pages_json,created) "
-            "VALUES (?,?,?,?)", rows)
-        return True
-    except Exception:
-        return False
 
 
 def migrate_drop_path(conn):
@@ -688,13 +651,13 @@ def migrate_meta_values(conn):
 
 
 def load_existing(conn):
-    """{name: (size, mtime, has_meta, error)}
+    """{name: (mtime, has_meta, error)}
 
-    只用来判断"内容有没有变", 与文件在哪无关 —— 路径不入库。
+    只用来判断"上次有没有成功", 与文件在哪、size 无关 —— 路径和大小都不入库作为主键。
     has_meta 只用于统计"多少文件没元数据", 不参与是否重读的判断。
     """
-    return {n: (s, m, h, e) for n, s, m, h, e in conn.execute(
-        "SELECT name, size, mtime, has_meta, error FROM archives")}
+    return {n: (m, h, e) for n, m, h, e in conn.execute(
+        "SELECT name, mtime, has_meta, error FROM archives")}
 
 
 # ---------------------------------------------------------------- 并行策略
@@ -1090,14 +1053,7 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
             found_paths[name] = path
             prev = existing.get(name)
             if prev is not None:
-                prev_size, _prev_mtime, prev_meta, prev_err = prev
-                if it["size"] is not None:
-                    st_size = it["size"]
-                else:
-                    try:
-                        st_size = os.path.getsize(path)
-                    except OSError:
-                        continue
+                _prev_mtime, prev_meta, prev_err = prev
                 # 只按 name 判断, 不比 size/路径/mtime。
                 # 库以 name 为唯一键: 同名文件即使大小不同, 元数据也只保留
                 # 最后处理的那个。拿 size 当判据会导致同名不同大小反复解析、
