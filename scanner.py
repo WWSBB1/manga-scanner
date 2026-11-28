@@ -651,13 +651,14 @@ def migrate_meta_values(conn):
 
 
 def load_existing(conn):
-    """{name: (mtime, has_meta, error)}
+    """{name: (mtime, has_meta, error, size)}
 
-    只用来判断"上次有没有成功", 与文件在哪、size 无关 —— 路径和大小都不入库作为主键。
-    has_meta 只用于统计"多少文件没元数据", 不参与是否重读的判断。
+    只用来判断"上次有没有成功", 与文件在哪、mtime 无关。
+    has_meta 只用于统计"多少文件没元数据", 不参与普通文件是否重读的判断;
+    但无元数据记录例外 —— 只有它的 size 参与比较: 内容换了就可能补上元数据。
     """
-    return {n: (m, h, e) for n, m, h, e in conn.execute(
-        "SELECT name, mtime, has_meta, error FROM archives")}
+    return {n: (m, h, e, s) for n, m, h, e, s in conn.execute(
+        "SELECT name, mtime, has_meta, error, size FROM archives")}
 
 
 # ---------------------------------------------------------------- 并行策略
@@ -1043,8 +1044,30 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
         # 本次扫到的位置: {name: 绝对路径}。路径只是"当下在哪"的临时记忆,
         # 供本次搬移使用; 不入库(文件挪个位置库里的路径就过期了)。
         found_paths = {}
+        seen_paths = {}
+        import re
+        suffix_re = re.compile(r"(\s*\(\d{1,2}\))+\.([^.]+)$")
+        all_names = {it["name"] for it in items}
+        suffix_skip = set()
+        for it in items:
+            m = suffix_re.search(it["name"])
+            if m and suffix_re.sub("." + m.group(2), it["name"]) in all_names:
+                suffix_skip.add(it["path"])
+        suffix_skipped = 0
         for it in items:
             path, name = it["path"], it["name"]
+            size = int(it.get("size") or 0)
+            if not size and it.get("src") is None and os.path.isfile(path):
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    size = 0
+            seen_paths.setdefault((name, size), []).append(path)
+            if path in suffix_skip:
+                suffix_skipped += 1
+                # 带序号且去掉序号后已有同名: 不解析元数据、不入库,
+                # 只放进删除候选, 等用户最后确认。
+                continue
             # 同名多次出现(同名文件散在多个目录): 取**最后**扫到的那个。
             # 必须与入库口径一致 —— 库里以 name 为唯一键, 后写的记录覆盖
             # 先写的, 所以库里的元数据来自最后一个。这里若取第一个,
@@ -1053,17 +1076,26 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
             found_paths[name] = path
             prev = existing.get(name)
             if prev is not None:
-                _prev_mtime, prev_meta, prev_err = prev
-                # 只按 name 判断, 不比 size/路径/mtime。
+                _prev_mtime, prev_meta, prev_err, prev_size = prev
+                # 只按 name 判断, 不比路径/mtime。
                 # 库以 name 为唯一键: 同名文件即使大小不同, 元数据也只保留
                 # 最后处理的那个。拿 size 当判据会导致同名不同大小反复解析、
                 # 反复覆盖; 内容真要更新用「强制重扫」。
+                # 例外: 上次没解析出元数据时, size 是唯一可用信号 —— 变了
+                # 就再读一次, 看新包有没有补上元数据。仍无元数据就照旧跳过。
                 if prev_err is None:
+                    if not prev_meta and size and prev_size and size != prev_size:
+                        emit(f"  ↻ 无元数据记录大小变化, 重新解析: {name} "
+                             f"{prev_size} -> {size}")
+                        todo.append(it)
+                        continue
                     skip_n += 1
                     if not prev_meta:
                         skipped_nometa += 1
                     continue
             todo.append(it)
+        if suffix_skipped:
+            emit(f"带序号重复文件跳过解析 {suffix_skipped} 个(等待确认删除)")
         emit(f"待处理 {len(todo)},增量跳过 {skip_n}"
              + (f"(其中 {skipped_nometa} 个解析不出元数据, 同名跳过)"
                 if skipped_nometa else ""))
@@ -1198,6 +1230,32 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
                     emit(f"  · {line}" + (f"  (共 {cnt} 个)" if cnt > 1 else ""))
                 if len(why) > 5:
                     emit(f"  · …另有 {len(why) - 5} 个失败文件未列出")
+        dup_candidates = []
+        # 名字池用最终入库的去重名单: 带序号的若和去掉序号后的名字同名,
+        # 必须列为待删; 不同目录里的同名普通文件也按同名同大小判重。
+        name_pool = set(found_paths)
+        all_paths = {}
+        for it in items:
+            all_paths.setdefault(it["name"], []).append(it["path"])
+        for (_name, size), paths in seen_paths.items():
+            ordered = sorted(paths)
+            m = suffix_re.search(_name)
+            if m:
+                base = suffix_re.sub("." + m.group(2), _name)
+                if base in name_pool:
+                    dup_candidates.append({
+                        "name": _name, "size": size, "base": base,
+                        "reason": "suffix", "keep": found_paths.get(base, base),
+                        "delete": ordered, "need_meta": False,
+                    })
+                    continue
+            if size <= 0 or len(paths) < 2:
+                continue
+            dup_candidates.append({"name": _name, "size": size,
+                                   "reason": "same", "keep": ordered[0],
+                                   "delete": ordered[1:], "need_meta": True})
+        if dup_candidates:
+            emit(f"发现待删除候选 {len(dup_candidates)} 组(仅记录, 不自动删除)")
         return {"total": len(items), "todo": len(todo), "done": done,
                 "fail": fail, "skip": skip_n,
                 # 解析成功但里面没有元数据文件的个数(它们也在 done 里)
@@ -1208,7 +1266,8 @@ def scan_dirs(dirs, db_path=DEFAULT_DB, log=print, rescan=False,
                 # 本次扫到的文件名(顺序=扫描顺序, 已去重)。浏览页靠它把
                 # 结果收窄到"这次扫到的那些", 不靠 scanned_at ——
                 # 增量跳过的记录不会刷新 scanned_at。
-                "names": list(found_paths)}
+                "names": list(found_paths),
+                "duplicate_candidates": dup_candidates}
     finally:
         conn.close()
 

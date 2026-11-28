@@ -13,8 +13,10 @@ import logging
 import os
 import re
 import sqlite3
+import zipfile
 import threading
 import time
+import concurrent.futures
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
@@ -95,6 +97,22 @@ def write_api_log(kind, detail=None):
     except Exception:
         pass
 
+
+CLIENT_LOG_BUF = []
+
+THUMB_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="reader-thumb")
+
+
+def flush_client_logs():
+    if not CLIENT_LOG_BUF:
+        return
+    batch = CLIENT_LOG_BUF[:]
+    del CLIENT_LOG_BUF[:len(batch)]
+    for item in batch:
+        write_api_log("CLIENT", item)
+
+
 import sys
 sys.path.insert(0, BASE)
 
@@ -107,6 +125,7 @@ import reader
 DB_PATH = os.environ.get("MANGA_DB",
                         os.path.join(BASE, "manga.db"))
 PORT = int(os.environ.get("MANGA_PORT", "8951"))
+THUMB_PORT = int(os.environ.get("MANGA_THUMB_PORT", str(PORT + 1)))
 
 FILTER_FIELDS = [
     ("artist", "作者"), ("group_name", "社团"), ("parody", "原作"),
@@ -126,6 +145,8 @@ FIELD_CN = {"name": "文件名", "artist": "作者", "parody": "原作",
 
 SCAN_WORKERS = {}   # scan_id -> {running, stop, log[], stats}
 CLS_WORKERS = {}    # cls_id -> {running, stop, log[], result}
+UPLOAD_PLANS = {}   # plan_id -> prepare 结果
+UPLOAD_WORKERS = {} # upload_id -> {running, log[], result}
 
 # 最近一次扫描扫到的文件名。浏览页默认只看这批 ——
 # 库里可能堆着几万条历史记录, 但用户此刻关心的是"刚扫的这批"。
@@ -170,6 +191,263 @@ def remote_note(path):
 # ================================================================ API
 
 class API:
+    @staticmethod
+    def upload_prepare(local_dir, recursive, target_root, compare_root):
+        """扫描本地 zip, 与远程目录缓存比对, 生成上传/删除计划。"""
+        if not local_dir or not os.path.isdir(local_dir):
+            return {"error": "本地路径不存在"}
+        if not target_root or not src_layer.is_remote(target_root):
+            return {"error": "上传目标必须是 WebDAV 远程路径"}
+        if not compare_root or not src_layer.is_remote(compare_root):
+            return {"error": "远程比对范围必须是 WebDAV 远程路径"}
+
+        targets, _unsupported = scanner._collect_targets(
+            [local_dir], scanner.walk_workers([local_dir]), None,
+            recursive=bool(recursive))
+
+        # 先处理本地文件名末尾的 (1)/(2) 序号: 直接重命名去掉序号。
+        # 若去掉序号后的目标文件已存在, 当前带序号文件视为重复, 进删除列表。
+        suffix_re = re.compile(r"(\s*\(\d{1,2}\))+(\.[^.]+)$")
+        renamed, delete = [], []
+        items = []
+        for path in targets:
+            name = os.path.basename(path)
+            m = suffix_re.search(name)
+            if m:
+                base_name = suffix_re.sub(m.group(2), name)
+                base_path = os.path.join(os.path.dirname(path), base_name)
+                if os.path.exists(base_path):
+                    try:
+                        size = os.path.getsize(path)
+                    except OSError:
+                        size = 0
+                    delete.append({"path": path, "name": name, "size": size,
+                                   "action": "delete_local",
+                                   "reason": "本地序号重复, 无序号文件已存在"})
+                    continue
+                try:
+                    os.rename(path, base_path)
+                    renamed.append((name, base_name))
+                    path, name = base_path, base_name
+                except OSError as ex:
+                    write_op_log("上传序号文件重命名失败",
+                                 {"path": path, "error": str(ex)})
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = 0
+            items.append({"path": path, "name": name, "size": size})
+        if renamed:
+            write_op_log("上传前重命名序号文件", {"renamed": renamed})
+
+        def local_has_meta(path):
+            try:
+                with zipfile.ZipFile(path) as zf:
+                    names = zf.namelist()
+                found, _extra, _images = scanner.classify_entries(names)
+                return bool(found)
+            except Exception:
+                return False
+
+        for it in items:
+            it["local_has_meta"] = local_has_meta(it["path"])
+
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            rows = conn.execute(
+                "SELECT root,files_json FROM dir_listing WHERE root=? OR root LIKE ?",
+                (compare_root, compare_root.rstrip("/") + "/%")).fetchall()
+        finally:
+            conn.close()
+        remote = {}
+        for root, fj in rows:
+            prefix = ""
+            if root.rstrip("/") != compare_root.rstrip("/"):
+                prefix = root[len(compare_root.rstrip("/")):].strip("/") + "/"
+            for x in json.loads(fj or "[]"):
+                nm = x.get("name")
+                if not nm:
+                    continue
+                remote.setdefault(nm, []).append({
+                    "name": nm, "size": int(x.get("size") or 0),
+                    "path": prefix + nm, "root": root,
+                })
+
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            meta_names = {r[0] for r in conn.execute(
+                "SELECT name FROM archives WHERE has_meta=1 AND error IS NULL")}
+        finally:
+            conn.close()
+
+        upload, no_meta = [], []
+        for it in items:
+            if not it.get("local_has_meta"):
+                no_meta.append(dict(it, action="pending",
+                                    reason="本地文件无元数据"))
+                continue
+            candidates = remote.get(it["name"], [])
+            if not candidates:
+                upload.append(dict(it, action="upload", reason="远程不存在"))
+                continue
+            same = [r for r in candidates if r["size"] == it["size"]]
+            if same:
+                delete.append(dict(it, action="delete_local",
+                                   reason="远程同名同大小", remote=same[0]))
+                continue
+            if it["name"] in meta_names:
+                delete.append(dict(it, action="delete_local",
+                                   reason="数据库已有元数据",
+                                   remote=candidates[0]))
+                continue
+            upload.append(dict(it, action="replace_remote",
+                               reason="远程同名不同大小且无元数据",
+                               remote=candidates[0]))
+
+        plan_id = f"upload_plan_{int(time.time() * 1000)}"
+        UPLOAD_PLANS[plan_id] = {
+            "local_dir": local_dir, "recursive": bool(recursive),
+            "target_root": target_root, "compare_root": compare_root,
+            "upload": upload, "delete": delete, "no_meta": no_meta,
+        }
+        write_op_log("上传比对", {"plan_id": plan_id,
+                              "local_count": len(items),
+                              "upload": len(upload), "delete": len(delete),
+                              "no_meta": len(no_meta)})
+        return {"plan_id": plan_id, "local_count": len(items),
+                "remote_count": len(remote),
+                "renamed_count": len(renamed),
+                "upload_count": len(upload), "delete_count": len(delete),
+                "no_meta_count": len(no_meta),
+                "upload": upload, "delete": delete, "no_meta": no_meta}
+
+    @staticmethod
+    def upload_start(plan_id):
+        plan = UPLOAD_PLANS.get(plan_id)
+        if not plan:
+            return {"error": "无效 plan_id"}
+        uid = f"upload_{int(time.time() * 1000)}"
+        UPLOAD_WORKERS[uid] = {"running": True, "log": [], "result": None,
+            "progress": {"phase": "准备", "done": 0, "total": 0, "current": ""}}
+
+        def log(msg):
+            UPLOAD_WORKERS[uid]["log"].append(msg)
+            write_api_log("UPLOAD", {"upload_id": uid, "msg": msg})
+
+        def progress(phase=None, done=None, total=None, current=None):
+            p = UPLOAD_WORKERS[uid]["progress"]
+            if phase is not None: p["phase"] = phase
+            if done is not None: p["done"] = done
+            if total is not None: p["total"] = total
+            if current is not None: p["current"] = current
+
+        def add_to_dir_cache(name, size):
+            """上传成功一个就立刻写缓存, 中途重启也不会丢记录。"""
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                try:
+                    row = conn.execute(
+                        "SELECT files_json FROM dir_listing WHERE root=?",
+                        (plan["target_root"],)).fetchone()
+                    listing = json.loads(row[0]) if row and row[0] else []
+                    if any(str(x.get("name")) == name for x in listing):
+                        return
+                    listing.append({"name": name, "size": size,
+                                    "mtime": int(time.time())})
+                    conn.execute("""INSERT INTO dir_listing (root,files_json,updated_at)
+                        VALUES (?,?,?) ON CONFLICT(root) DO UPDATE SET
+                        files_json=excluded.files_json, updated_at=excluded.updated_at""",
+                        (plan["target_root"],
+                         json.dumps(listing, ensure_ascii=False), time.time()))
+                    conn.commit()
+                finally:
+                    conn.close()
+            except Exception as ex:
+                log(f"  · 目录缓存即时写入失败 {name}: {ex}")
+
+        def worker():
+            result = {"ok": 0, "fail": 0, "results": [],
+                      "delete": plan["delete"]}
+            try:
+                scan_targets = [x["path"] for x in plan["upload"]]
+                if scan_targets:
+                    progress("扫描元数据", 0, len(scan_targets), "")
+                    log(f"上传前本地扫描 {len(scan_targets)} 个")
+                    conn = sqlite3.connect(DB_PATH)
+                    try:
+                        existing = {r[0] for r in conn.execute(
+                            "SELECT name FROM archives WHERE has_meta=1 AND error IS NULL")}
+                        for si, path in enumerate(scan_targets, 1):
+                            name = os.path.basename(path)
+                            progress("扫描元数据", si, len(scan_targets), name)
+                            if name in existing:
+                                log(f"  · {name}: 数据库已有记录, 跳过解析")
+                                continue
+                            try:
+                                rec = scanner.scan_one(path)
+                                scanner.save(conn, rec)
+                                conn.commit()
+                                log(f"  ✓ {name}: 元数据已解析")
+                            except Exception as ex:
+                                log(f"  ✗ {name}: 元数据解析失败 {ex}")
+                    finally:
+                        conn.close()
+
+                source = src_layer.get_source(plan["target_root"])
+                total_upload = len(plan["upload"])
+                progress("上传", 0, total_upload, "")
+                for ui, it in enumerate(plan["upload"], 1):
+                    name, path = it["name"], it["path"]
+                    progress("上传", ui - 1, total_upload, name)
+                    rel = name
+                    if it.get("action") == "replace_remote" and it.get("remote"):
+                        old = it["remote"].get("path") or name
+                        if "/" in old:
+                            rel = old
+                    if it.get("action") == "replace_remote" and it.get("remote"):
+                        old_info = it["remote"]
+                        old_root = old_info.get("root") or plan["compare_root"]
+                        old_rel = old_info.get("name") or name
+                        try:
+                            old_source = src_layer.get_source(old_root)
+                            ret, msg = old_source.delete(old_rel)
+                            log(f"  · 删除远程旧文件 {old_root}/{old_rel}: {ret} {msg}")
+                        except Exception as ex:
+                            log(f"  · 删除远程旧文件失败 {old_root}/{old_rel}: {ex}")
+                    log(f"  ↑ 上传 {path} -> {rel}")
+                    ret, msg = source.upload(rel, path)
+                    if ret == "ok":
+                        result["ok"] += 1
+                        result["results"].append((path, "ok", msg))
+                        add_to_dir_cache(name, it["size"])
+                    else:
+                        result["fail"] += 1
+                        result["results"].append((path, "fail", msg))
+                    log(f"  {ret} {path}: {msg}")
+
+                progress("更新缓存", total_upload, total_upload, "")
+            except Exception as ex:
+                result["error"] = str(ex)[:300]
+                log(f"上传失败: {ex}")
+            finally:
+                progress("完成", UPLOAD_WORKERS[uid]["progress"]["total"],
+                         UPLOAD_WORKERS[uid]["progress"]["total"], "")
+                UPLOAD_WORKERS[uid]["result"] = result
+                UPLOAD_WORKERS[uid]["running"] = False
+                write_op_log("上传结束", {"upload_id": uid,
+                                      "ok": result["ok"], "fail": result["fail"]})
+
+        threading.Thread(target=worker, daemon=True).start()
+        return {"upload_id": uid}
+
+    @staticmethod
+    def upload_status(uid):
+        w = UPLOAD_WORKERS.get(uid)
+        if not w:
+            return {"error": "无效 upload_id"}
+        return {"running": w["running"], "log": w["log"],
+                "progress": w.get("progress"), "result": w["result"]}
+
     @staticmethod
     def scan_start(dirs, db, rescan, recursive=True):
         sid = f"scan_{int(time.time())}"
@@ -469,20 +747,30 @@ class API:
     @staticmethod
     def reader_pages(name, src_dir, size=0):
         """打开漫画时直接读 zip 页列表(自然排序), 不依赖数据库页索引。"""
+        started = time.time()
+        rel0 = API._reader_rel_path(name)
+        write_api_log("READER_PAGES_BEGIN", {"name": rel0, "src_dir": src_dir, "size": size})
         try:
             rel = API._reader_rel_path(name)
             if not src_dir or rel is None:
+                write_api_log("READER_PAGES_ERROR", {"reason": "参数错误"})
                 return {"error": "参数错误"}
             name = rel
             source = src_layer.get_source(src_dir)
             fp = reader.open_manga(source, name, size=size, root=src_dir)
             if not fp:
+                write_api_log("READER_PAGES_ERROR", {"reason": "找不到这个文件", "name": name})
                 return {"error": "找不到这个文件"}
             pages = reader._list_pages_fp(fp)
             if not pages:
+                write_api_log("READER_PAGES_ERROR", {"reason": "没有图片", "name": name})
                 return {"error": "不是可阅读的 zip, 或里面没有图片"}
+            write_api_log("READER_PAGES_OK", {"name": name, "count": len(pages),
+                                              "first": pages[0],
+                                              "elapsed": round(time.time()-started, 3)})
             return {"name": name, "pages": pages, "count": len(pages)}
         except Exception as ex:
+            write_api_log("READER_PAGES_EXCEPTION", {"error": str(ex)})
             return {"error": str(ex)}
 
     @staticmethod
@@ -505,34 +793,52 @@ class API:
     @staticmethod
     def reader_thumb(name, size, src_dir):
         if not src_dir:
+            write_api_log("READER_THUMB_SKIP", {"reason": "没有 src_dir", "name": name})
             return None
         try:
             size = int(size)
         except (TypeError, ValueError):
+            write_api_log("READER_THUMB_SKIP", {"reason": "size 非数字", "name": name, "size": size})
             return None
         # 只接受文件名, 不接受带斜杠/..的路径
         name = API._reader_rel_path(name)
         if not src_dir or name is None:
+            write_api_log("READER_THUMB_SKIP", {"reason": "非法路径", "name": name})
             return None
         # 缓存命中: reader.get_thumb 直接查本地缓存, 不碰数据源;
         # 未命中才让数据源(本地/WebDAV)读 zip 第一张图。
         try:
             source = src_layer.get_source(src_dir)
-        except Exception:
+        except Exception as ex:
+            write_api_log("READER_THUMB_SOURCE_ERROR", {"name": name, "error": str(ex)})
             return None
-        return reader.get_thumb(name, size, source=source, root=src_dir)
+        started=time.time()
+        got=reader.get_thumb(name, size, source=source, root=src_dir)
+        write_api_log("READER_THUMB_RESULT", {"name": name, "ok": bool(got),
+                                              "mime": got[1] if got else None,
+                                              "elapsed": round(time.time()-started, 3)})
+        return got
 
     @staticmethod
     def reader_page_image(name, src_dir, entry, size=0):
         rel = API._reader_rel_path(name)
         if not src_dir or rel is None:
+            write_api_log("READER_PAGE_SKIP", {"reason": "参数错误", "entry": entry})
             return None
         name = rel
+        started=time.time()
         try:
             source = src_layer.get_source(src_dir)
             fp = reader.open_manga(source, name, size=size, root=src_dir)
-            return reader.get_page_fp(fp, entry)
-        except Exception:
+            got = reader.get_page_fp(fp, entry) if fp else None
+            write_api_log("READER_PAGE_RESULT", {"name": name, "entry": entry,
+                                                 "ok": bool(got),
+                                                 "bytes": len(got[0]) if got else 0,
+                                                 "elapsed": round(time.time()-started, 3)})
+            return got
+        except Exception as ex:
+            write_api_log("READER_PAGE_EXCEPTION", {"name": name, "entry": entry,
+                                                    "error": str(ex)})
             return None
 
     @staticmethod
@@ -1067,10 +1373,10 @@ checkbox-row{display:block;margin:4px 0}
   padding:16px;max-height:80vh;overflow-y:auto}
 
 /* 详情弹窗: 默认隐藏(#detail-modal 没有 .show 时不显示) */
-#detail-modal{position:fixed;inset:0;background:rgba(0,0,0,.5);
+#detail-modal,#dup-modal{position:fixed;inset:0;background:rgba(0,0,0,.5);
   z-index:200;display:none;align-items:center;justify-content:center}
-#detail-modal.show{display:flex}
-#detail-modal>.card{width:90%;max-width:500px;max-height:80vh;overflow-y:auto}
+#detail-modal.show,#dup-modal.show{display:flex}
+#detail-modal>.card,#dup-modal>.card{width:90%;max-width:500px;max-height:80vh;overflow-y:auto}
 .md-chip{display:inline-block;padding:4px 9px;margin:2px;border-radius:14px;
   border:1px solid #ddd;background:#fff;color:#555;font-size:12px;cursor:pointer;
   -webkit-tap-highlight-color:transparent}
@@ -1473,6 +1779,91 @@ body.rd-open .nav{display:none}
 </div>
 </div>
 
+<!-- ===== 上传页 ===== -->
+<div id="page-upload" class="page hidden">
+  <h2>⬆️ 上传</h2>
+  <div class="card">
+    <div style="font-size:12px;color:#666;margin-bottom:6px">本地漫画压缩包所在目录</div>
+    <div class="row" style="position:relative">
+      <input type="text" id="up-local" placeholder="本地路径">
+      <button class="outline" onclick="upHistToggle('local')" style="flex:0 0 auto;padding:6px 8px">历史</button>
+    </div>
+    <div id="up-local-hist-box" class="rd-hist-pop" style="display:none"></div>
+    <div class="row" style="font-size:13px;align-items:center;margin-top:4px">
+      <label><input type="checkbox" id="up-recursive"> 递归扫描本地子目录</label>
+    </div>
+
+    <div style="font-size:12px;color:#666;margin:10px 0 4px">
+      <b>上传目标</b>：本地文件最终传到这个远程目录
+    </div>
+    <div class="row" style="position:relative">
+      <input type="text" id="up-target" placeholder="上传目标远程路径">
+      <button class="outline" onclick="upHistToggle('target')" style="flex:0 0 auto;padding:6px 8px">历史</button>
+    </div>
+    <div id="up-target-hist-box" class="rd-hist-pop" style="display:none"></div>
+
+    <div style="font-size:12px;color:#666;margin:10px 0 4px">
+      <b>比对范围</b>：用这个远程目录下的文件列表判断是否重复（含子目录）
+    </div>
+    <div class="row" style="position:relative">
+      <input type="text" id="up-compare" placeholder="远程比对范围路径">
+      <button class="outline" onclick="upHistToggle('compare')" style="flex:0 0 auto;padding:6px 8px">历史</button>
+    </div>
+    <div id="up-compare-hist-box" class="rd-hist-pop" style="display:none"></div>
+
+    <div class="row" style="margin-top:10px">
+      <button onclick="upPrepare()">获取文件列表并比对</button>
+      <button class="outline" onclick="upStart()">开始上传</button>
+    </div>
+    <div id="up-summary" style="font-size:12px;color:#666;margin-top:6px"></div>
+    <div id="up-progress-box" style="display:none;margin-top:10px">
+      <div class="progress"><div id="up-progress-fill" class="progress-fill" style="width:0%"></div></div>
+      <div id="up-progress-text" style="font-size:12px;color:#666;margin-top:4px"></div>
+    </div>
+    <div id="up-log" style="font-size:12px;line-height:1.6;margin-top:8px;max-height:220px;overflow:auto"></div>
+  </div>
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <b>本地无元数据 <span id="up-nometa-count" style="color:#ff9800"></span></b>
+      <span>
+        <button class="outline" onclick="upNoMetaAll()" style="background:#ff9800;color:#fff;border-color:#ff9800">全部加入待上传</button>
+      </span>
+    </div>
+    <div id="up-nometa-list" style="font-size:12px;line-height:1.6"></div>
+    <div id="up-nometa-pager" style="font-size:12px;color:#666;text-align:center;margin-top:6px"></div>
+  </div>
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <b>待上传 <span id="up-upload-count" style="color:#1976d2"></span></b>
+      <button class="outline" id="up-upload-more" onclick="upMoreAll('upload')" style="display:none">展开更多</button>
+    </div>
+    <div id="up-upload-list" style="font-size:12px;line-height:1.6"></div>
+    <div id="up-upload-pager" style="font-size:12px;color:#666;text-align:center;margin-top:6px"></div>
+  </div>
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <b>待删除本地重复文件 <span id="up-delete-count" style="color:#c62828"></span></b>
+      <span>
+        <button class="outline" onclick="upDeleteAll()" style="background:#c62828;color:#fff;border-color:#c62828">删除全部</button>
+        <button class="outline" id="up-delete-more" onclick="upMoreAll('delete')" style="display:none">展开更多</button>
+      </span>
+    </div>
+    <div id="up-delete-list" style="font-size:12px;line-height:1.6"></div>
+    <div id="up-delete-pager" style="font-size:12px;color:#666;text-align:center;margin-top:6px"></div>
+  </div>
+  <div class="card hidden" id="up-delete-confirm-card" style="border:2px solid #c62828">
+    <div class="row" style="justify-content:space-between">
+      <b style="color:#c62828">确认删除本地重复文件</b>
+      <button class="outline" onclick="closeUpDeleteModal()">关闭</button>
+    </div>
+    <div id="up-delete-confirm-list" style="font-size:12px;line-height:1.6"></div>
+    <div class="row" style="justify-content:flex-end;margin-top:10px">
+      <button class="outline" onclick="closeUpDeleteModal()">取消</button>
+      <button onclick="confirmUpDelete()" style="background:#c62828">确认删除</button>
+    </div>
+  </div>
+</div>
+
 </div>
 
 <!-- 详情弹窗(默认隐藏, 点文件名才弹出) -->
@@ -1480,12 +1871,28 @@ body.rd-open .nav{display:none}
   <div class="card">
     <div class="row" style="justify-content:space-between">
       <b>详情</b>
-      <button class="outline" onclick="closeDetail()">关闭</button>
+      <span>
+        <button class="outline" onclick="mdApply()" style="background:#1976d2;color:#fff">应用筛选</button>
+        <button class="outline" onclick="closeDetail()">关闭</button>
+      </span>
     </div>
     <div id="detail-content" style="margin-top:8px"></div>
     <div class="row" style="justify-content:flex-end;margin-top:10px">
       <button class="outline" onclick="closeDetail()">关闭</button>
-      <button class="outline" onclick="mdApply()" style="background:#1976d2;color:#fff">应用筛选</button>
+    </div>
+  </div>
+</div>
+
+<div id="dup-modal" onclick="if(event.target===this)closeDupModal()">
+  <div class="card" style="max-height:80vh;overflow:auto">
+    <div class="row" style="justify-content:space-between">
+      <b>重复文件确认</b>
+      <button class="outline" onclick="closeDupModal()">关闭</button>
+    </div>
+    <div id="dup-list" style="font-size:12px;line-height:1.6"></div>
+    <div class="row" style="justify-content:flex-end;margin-top:10px">
+      <button class="outline" onclick="closeDupModal()">取消</button>
+      <button onclick="confirmDeleteDups()" style="background:#c62828">删除后者</button>
     </div>
   </div>
 </div>
@@ -1497,6 +1904,7 @@ body.rd-open .nav{display:none}
   <a onclick="showPage('browse')" id="nav-browse"><span class="icon">🔍</span>浏览</a>
   <a onclick="showPage('classify')" id="nav-classify"><span class="icon">📂</span>分类</a>
   <a onclick="showPage('stats')" id="nav-stats"><span class="icon">📊</span>统计</a>
+  <a onclick="showPage('upload')" id="nav-upload"><span class="icon">⬆️</span>上传</a>
 </nav>
 
 <!-- 阅读器弹层 -->
@@ -1514,6 +1922,236 @@ body.rd-open .nav{display:none}
 </div>
 
 <script>
+function clientLog(stage,data){
+  try{
+    console.log('[CLIENT] '+stage,data||{});
+    fetch('/api/client/log',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({stage:stage,data:data||{},t:Date.now()}),keepalive:true})
+      .catch(()=>{});
+  }catch(e){console.log('[CLIENT] 日志失败',stage,e)}
+}
+
+let dupCandidates=[];
+function closeDupModal(){document.getElementById('dup-modal').classList.remove('show')}
+function showDupModal(list){
+  dupCandidates=list||[];
+  if(!dupCandidates.length)return;
+  const box=document.getElementById('dup-list');
+  box.innerHTML=dupCandidates.map((g,i)=>
+    '<div style="margin-bottom:10px"><b>'+esc(g.name)+'</b> '+
+    (g.size?'<span style="color:#666">'+fmtSize(g.size)+'</span>':'')+
+    (g.reason==='suffix'?' <span style="color:#ff9800">[序号重复, 必须删除]</span>':'')+'<br>'+
+    '<span style="color:#388e3c">保留: '+esc(g.keep)+'</span><br>'+
+    g.delete.map(p=>'<span style="color:#c62828">删除: '+esc(p)+'</span>').join('<br>')+
+    '</div>').join('');
+  document.getElementById('dup-modal').classList.add('show');
+}
+function confirmDeleteDups(){
+  const paths=[];dupCandidates.forEach(g=>paths.push(...g.delete));
+  if(!paths.length){closeDupModal();return}
+  const must=dupCandidates.filter(g=>g.reason==='suffix').length;
+  if(!confirm('确认删除 '+paths.length+' 个文件？'+(must?'\n其中 '+must+' 组是序号重复文件, 必须删除。':'')))return;
+  fetch('/api/duplicates/delete',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({paths:paths})}).then(r=>r.json()).then(d=>{
+      closeDupModal();
+      alert('删除完成: 成功 '+(d.ok||0)+' 失败 '+(d.fail||0));
+    });
+}
+let upPlanId=null, upUploadId=null, upPollTimer=null, upDeletePaths=[];
+let upUploadItems=[], upDeleteItems=[], upNoMetaItems=[], upNoMetaLimit=10;
+let upGroupLimits={upload:{},delete:{}};
+const UP_HIST_KEYS={local:'manga_upload_local_hist',target:'manga_upload_target_hist',compare:'manga_upload_compare_hist'};
+function upV(id){const e=document.getElementById(id);return e?e.value.trim():''}
+function upHist(which){try{return JSON.parse(localStorage.getItem(UP_HIST_KEYS[which])||'[]')}catch(e){return []}}
+function upHistPush(which,v){
+  v=(v||'').trim();if(!v)return;
+  const h=upHist(which).filter(x=>x!==v);h.unshift(v);
+  try{localStorage.setItem(UP_HIST_KEYS[which],JSON.stringify(h.slice(0,20)))}catch(e){}
+}
+function upHistRender(which){
+  const box=document.getElementById('up-'+which+'-hist-box');if(!box)return;
+  const h=upHist(which);
+  box.innerHTML=h.length?h.map(v=>
+    '<div class="rd-hi" onclick="upHistPick(\''+which+'\',\''+encodeURIComponent(v)+'\')">'+esc(v)+'</div>').join(''):
+    '<div class="rd-hi" style="color:#999">暂无历史, 比对后会记住当前路径</div>';
+}
+function upHistToggle(which){
+  const box=document.getElementById('up-'+which+'-hist-box');if(!box)return;
+  if(box.style.display==='none'){upHistRender(which);box.style.display='block'}
+  else box.style.display='none';
+}
+function upHistPick(which,enc){
+  const v=decodeURIComponent(enc);
+  document.getElementById('up-'+which).value=v;
+  document.querySelectorAll('#page-upload .rd-hist-pop').forEach(e=>e.style.display='none');
+}
+function upRenderList(kind){
+  const items=kind==='upload'?upUploadItems:upDeleteItems;
+  const limits=upGroupLimits[kind]||(upGroupLimits[kind]={});
+  const box=document.getElementById('up-'+kind+'-list');
+  const pager=document.getElementById('up-'+kind+'-pager');
+  const more=document.getElementById('up-'+kind+'-more');
+  document.getElementById('up-'+kind+'-count').textContent='('+items.length+')';
+  const groups={};
+  items.forEach(x=>{(groups[x.reason]||(groups[x.reason]=[])).push(x)});
+  let totalShown=0, hasMore=false;
+  box.innerHTML=Object.keys(groups).map(reason=>{
+    const arr=groups[reason];
+    const lim=limits[reason]||10;
+    const take=Math.min(arr.length,lim);
+    totalShown+=take;
+    if(arr.length>take)hasMore=true;
+    return '<div style="font-weight:bold;color:#555;margin:6px 0 2px">'+esc(reason)+
+      ' ('+arr.length+')</div>'+
+      arr.slice(0,take).map(x=>
+        '<div style="padding-left:8px">'+esc(x.name)+' '+
+        '<span style="color:#666">'+fmtSize(x.size)+'</span></div>').join('')+
+      (arr.length>take?'<div style="padding-left:8px;color:#1976d2;cursor:pointer" '+
+        'onclick="upMoreOne(\''+kind+'\',\''+encodeURIComponent(reason)+'\')">'+
+        '本组还有 '+(arr.length-take)+' 个, 点这里再展开一段</div>':'');
+  }).join('')||'无';
+  if(hasMore){
+    more.style.display='inline-block';
+    more.textContent='展开更多(每组各加10个)';
+  }else{
+    more.style.display='none';
+  }
+  pager.textContent=items.length?('显示 '+totalShown+' / '+items.length+' 个'):'';
+}
+function upRenderNoMeta(){
+  const items=upNoMetaItems;
+  const box=document.getElementById('up-nometa-list');
+  const pager=document.getElementById('up-nometa-pager');
+  document.getElementById('up-nometa-count').textContent='('+items.length+')';
+  box.innerHTML=items.slice(0,upNoMetaLimit).map(x=>
+    '<div>'+esc(x.name)+' <span style="color:#666">'+fmtSize(x.size)+'</span> '+
+    '<button class="outline" style="padding:2px 8px;font-size:12px" onclick="upNoMetaAdd(\''+encodeURIComponent(x.path)+'\')">加入待上传</button> '+
+    '<button class="outline" style="padding:2px 8px;font-size:12px" onclick="upNoMetaIgnore(\''+encodeURIComponent(x.path)+'\')">忽略×</button></div>').join('')||'无';
+  pager.textContent=items.length>upNoMetaLimit?'显示 '+Math.min(upNoMetaLimit,items.length)+' / '+items.length:'';
+}
+function upNoMetaAdd(enc){
+  const path=decodeURIComponent(enc);
+  const idx=upNoMetaItems.findIndex(x=>x.path===path);
+  if(idx<0)return;
+  const it=upNoMetaItems.splice(idx,1)[0];
+  it.action='upload';it.reason='手动加入(本地无元数据)';
+  upUploadItems.push(it);
+  upRenderNoMeta();upRenderList('upload');
+}
+function upNoMetaIgnore(enc){
+  const path=decodeURIComponent(enc);
+  upNoMetaItems=upNoMetaItems.filter(x=>x.path!==path);
+  upRenderNoMeta();
+}
+function upNoMetaAll(){
+  if(!upNoMetaItems.length)return;
+  upNoMetaItems.forEach(x=>{x.action='upload';x.reason='手动加入(本地无元数据)';upUploadItems.push(x)});
+  upNoMetaItems=[];
+  upRenderNoMeta();upRenderList('upload');
+}
+function upMoreOne(kind, reasonEnc){
+  const reason=decodeURIComponent(reasonEnc);
+  if(!upGroupLimits[kind])upGroupLimits[kind]={};
+  upGroupLimits[kind][reason]=(upGroupLimits[kind][reason]||10)+10;
+  upRenderList(kind);
+}
+function upMoreAll(kind){
+  const items=kind==='upload'?upUploadItems:upDeleteItems;
+  const groups={};
+  items.forEach(x=>{(groups[x.reason]||(groups[x.reason]=[])).push(x)});
+  Object.keys(groups).forEach(reason=>{
+    if(!upGroupLimits[kind])upGroupLimits[kind]={};
+    upGroupLimits[kind][reason]=(upGroupLimits[kind][reason]||10)+10;
+  });
+  upRenderList(kind);
+}
+function upDeleteAll(){
+  if(!upDeleteItems.length){alert('没有待删除文件');return}
+  if(!confirm('确认删除全部 '+upDeleteItems.length+' 个本地重复文件？'))return;
+  fetch('/api/upload/delete',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({paths:upDeleteItems.map(x=>x.path)})}).then(r=>r.json()).then(d=>{
+      const removed=new Set((d.results||[]).filter(x=>x[1]==='ok').map(x=>x[0]));
+      upDeleteItems=upDeleteItems.filter(x=>!removed.has(x.path));
+      upRenderList('delete');
+      alert('删除完成: 成功 '+(d.ok||0)+' 失败 '+(d.fail||0));
+    });
+}
+function upV(id){const e=document.getElementById(id);return e?e.value.trim():''}
+function upPrepare(){
+  const body={local_dir:upV('up-local'),recursive:document.getElementById('up-recursive').checked,
+    target_root:upV('up-target'),compare_root:upV('up-compare')};
+  document.getElementById('up-summary').textContent='正在比对...';
+  fetch('/api/upload/prepare',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(body)}).then(r=>r.json()).then(d=>{
+      if(d.error){alert(d.error);document.getElementById('up-summary').textContent=d.error;return}
+      if(d.remote_count===0 && !confirm('警告: 比对范围内一个远程文件都没读到(remote_count=0)。\n请确认远程路径填对了。仍要继续吗？'))return;
+      upPlanId=d.plan_id;upUploadId=null;
+      upUploadItems=d.upload||[];upDeleteItems=d.delete||[];upNoMetaItems=d.no_meta||[];
+      upGroupLimits={upload:{},delete:{}};upNoMetaLimit=10;
+      upHistPush('local',body.local_dir);upHistPush('target',body.target_root);
+      upHistPush('compare',body.compare_root);
+      document.getElementById('up-summary').textContent=
+        '本地 '+d.local_count+' 个, 已重命名 '+(d.renamed_count||0)+' 个, '+
+        '无元数据 '+d.no_meta_count+' 个, 待上传 '+d.upload_count+' 个, 待删除 '+d.delete_count+' 个';
+      upRenderNoMeta();upRenderList('upload');upRenderList('delete');
+      document.getElementById('up-log').innerHTML='';
+    });
+}
+function upStart(){
+  if(!upPlanId){alert('请先获取文件列表并比对');return}
+  fetch('/api/upload/start',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({plan_id:upPlanId})}).then(r=>r.json()).then(d=>{
+      if(d.error){alert(d.error);return}
+      upUploadId=d.upload_id;
+      document.getElementById('up-progress-box').style.display='block';
+      document.getElementById('up-progress-fill').style.width='0%';
+      document.getElementById('up-progress-text').textContent='准备中...';
+      document.getElementById('up-summary').textContent='上传中...';
+      upPoll();
+    });
+}
+function upPoll(){
+  if(!upUploadId)return;
+  fetch('/api/upload/status?id='+encodeURIComponent(upUploadId)).then(r=>r.json()).then(d=>{
+    if(d.error){document.getElementById('up-log').textContent=d.error;return}
+    const pg=d.progress||{};
+    if(pg.total){
+      const pct=Math.round((pg.done||0)/(pg.total||1)*100);
+      document.getElementById('up-progress-fill').style.width=pct+'%';
+      document.getElementById('up-progress-text').textContent=
+        (pg.phase||'')+'  '+(pg.done||0)+' / '+pg.total+
+        (pg.current?('  '+pg.current):'');
+    }
+    const logs=d.log||[];
+    document.getElementById('up-log').innerHTML=logs.slice(-120).map(esc).join('<br>');
+    document.getElementById('up-log').scrollTop=document.getElementById('up-log').scrollHeight;
+    if(d.running){upPollTimer=setTimeout(upPoll,800);return}
+    const r=d.result||{};
+    document.getElementById('up-summary').textContent=
+      '上传完成: 成功 '+(r.ok||0)+' 失败 '+(r.fail||0);
+    document.getElementById('up-progress-text').textContent='完成';
+    if(r.delete&&r.delete.length)showUpDeleteModal(r.delete);
+  });
+}
+function showUpDeleteModal(list){
+  upDeletePaths=(list||[]).map(x=>x.path);
+  document.getElementById('up-delete-confirm-list').innerHTML=(list||[]).map(x=>
+    '<div>'+esc(x.name)+' <span style="color:#c62828">'+esc(x.reason)+'</span><br>'+
+    '<span style="color:#666">'+esc(x.path)+'</span></div>').join('');
+  const card=document.getElementById('up-delete-confirm-card');
+  card.classList.remove('hidden');
+  card.scrollIntoView({behavior:'smooth',block:'start'});
+}
+function closeUpDeleteModal(){document.getElementById('up-delete-confirm-card').classList.add('hidden')}
+function confirmUpDelete(){
+  if(!upDeletePaths.length){closeUpDeleteModal();return}
+  if(!confirm('确认删除 '+upDeletePaths.length+' 个本地重复文件？'))return;
+  fetch('/api/upload/delete',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({paths:upDeletePaths})}).then(r=>r.json()).then(d=>{
+      closeUpDeleteModal();
+      alert('删除完成: 成功 '+(d.ok||0)+' 失败 '+(d.fail||0));
+    });
+}
 let scanId=null, clsId=null, pollTimer=null, clsPollTimer=null;
 
 // 字段名 -> 中文(统计页和分类页共用)
@@ -1538,6 +2176,16 @@ function showPage(p){
   if(p==='stats')loadStats();
   // 浏览页同理: 进来就按当前范围(默认"本次扫描到的")显示
   if(p==='browse'){loadScopeHint();loadDistinct();doQuery();}
+  if(p==='upload'){
+    // 远程路径默认取各自历史里最近一条
+    [['local','up-local'],['target','up-target'],['compare','up-compare']].forEach(pair=>{
+      const el=document.getElementById(pair[1]);
+      if(el && !el.value){
+        const h=upHist(pair[0]);
+        if(h.length)el.value=h[0];
+      }
+    });
+  }
   if(p==='read'){
     rdRestoreOpts();rdRenderFavs();dirHistRender('rd');
     const key=rdDir()+'|'+(document.getElementById('rd-subdirs')?.checked?'1':'0');
@@ -1576,7 +2224,7 @@ const RD_FIELDS={tags:'标签',artist:'作者',group_name:'社团',parody:'原�
   character:'角色',category:'分类',language:'语言',title:'标题'};
 let rdFavs=JSON.parse(localStorage.getItem('manga_rd_favs')||'[]');
 let rdSel=[], rdItems=[], rdView=null, rdPageIdx=0, rdQuickTimer=null, rdHistoryPushed=false, rdDelTimer=null, rdManageFavs=false;
-let rdExpanded=new Set(), rdListPage=0, rdDirTotal=0, rdPageReq=0, rdLoaded=false, rdLoadedKey="";
+let rdExpanded=new Set(), rdGroupPages={}, rdListPage=0, rdDirTotal=0, rdPageReq=0, rdLoaded=false, rdLoadedKey="";
 const RD_PAGE_SIZE=30;
 function rdSortMode(){const el=document.getElementById('rd-sort');
   const v=el?el.value:(localStorage.getItem('manga_rd_sort')||'date');
@@ -1586,7 +2234,7 @@ function rdOrder(){const el=document.getElementById('rd-order');
   return v==='asc'?'asc':'desc'}
 function rdChangeSort(){localStorage.setItem('manga_rd_sort',rdSortMode());
   localStorage.setItem('manga_rd_order',rdOrder());
-  rdListPage=0;rdExpanded.clear();rdSortItems();rdRenderView()}
+  rdListPage=0;rdExpanded.clear();rdGroupPages={};rdSortItems();rdRenderView()}
 function rdItemCmp(a,b){const mode=rdSortMode(), sign=rdOrder()==='asc'?1:-1;
   const dateKey=it=>{const y=Number(it.year)||0,m=Number(it.month)||0,d=Number(it.day)||0;
     return y*10000+m*100+d};
@@ -1598,7 +2246,7 @@ function rdSortItems(){rdItems.sort(rdItemCmp)}
 function rdViewMode(){const v=localStorage.getItem('manga_rd_view')||'grid';
   return document.getElementById('rd-view')&&v!=='grid'?v:'grid'}
 function rdChangeView(){const v=document.getElementById('rd-view').value;
-  localStorage.setItem('manga_rd_view',v);rdExpanded.clear();rdRenderView()}
+  localStorage.setItem('manga_rd_view',v);rdExpanded.clear();rdGroupPages={};rdRenderView()}
 function rdNatural(a,b){const re=/(\d+)/g,A=String(a).split(re),B=String(b).split(re);
   for(let i=0;i<Math.min(A.length,B.length);i++){
     const x=A[i],y=B[i];
@@ -1632,23 +2280,34 @@ function rdRenderGroups(){const grid=document.getElementById('rd-grid');
   grid.innerHTML=pageGroups.map((g,i)=>{
     const gi=start+i;
     const exp=rdExpanded.has(g.label);
-    const cards=g.items.slice(0,10).map(it=>{
+    const gp=rdGroupPages[g.label]||0;
+    const gStart=gp*RD_PAGE_SIZE;
+    const gItems=exp?g.items.slice(gStart,gStart+RD_PAGE_SIZE):g.items.slice(0,10);
+    const cards=gItems.map(it=>{
       const idx=rdItems.indexOf(it);
       const open=it.open_name||it.name;
       const src=rdSrcAttr(prevSrc,open);
-      if(src)openSet[open]=src;
-      return '<div class="rd-gcard" onclick="rdOpen('+idx+')">'+
-        '<img alt="" data-name="'+esc(open)+'" data-size="'+it.size+'"'+src+'>'+
-        '<div class="rd-gname">'+esc(it.title_original||it.title||it.name)+'</div></div>';
+      if(src)openSet[open]=prevSrc[open];
+      return '<div class="rd-gcard">'+
+        '<img alt="" onclick="rdOpen('+idx+')" data-name="'+esc(open)+'" data-size="'+it.size+'"'+src+'>'+
+        '<div class="rd-gname rd-meta-btn" onclick="rdShowDetail('+idx+')">'+esc(it.title_original||it.title||it.name)+'</div></div>';
     }).join('');
-    const rest=exp?'<div class="rd-gexpand">'+g.items.map(it=>{
+    let pager='';
+    if(exp&&g.items.length>RD_PAGE_SIZE){
+      const pages=Math.ceil(g.items.length/RD_PAGE_SIZE);
+      pager='<div class="rd-gpager" style="padding:6px 10px;text-align:center">'+
+        '<button class="outline" onclick="rdTurnGroup('+gi+',-1)"'+(gp<=0?' disabled':'')+'>上页</button> '+
+        '<span style="font-size:12px;color:#666;margin:0 8px">'+(gp+1)+' / '+pages+'</span> '+
+        '<button class="outline" onclick="rdTurnGroup('+gi+',1)"'+(gp>=pages-1?' disabled':'')+'>下页</button></div>';
+    }
+    const rest=exp?'<div class="rd-gexpand">'+gItems.map(it=>{
       const idx=rdItems.indexOf(it);
       const open=it.open_name||it.name;
       return '<div class="rd-card">'+
         '<img class="rd-thumb" style="cursor:pointer" onclick="rdOpen('+idx+')" alt="" data-name="'+esc(open)+'" data-size="'+it.size+'"'+rdSrcAttr(openSet,open)+'>'+
         '<div class="rd-meta rd-meta-btn" onclick="rdShowDetail('+idx+')">'+
         '<div class="rd-name">'+esc(it.title_original||it.title||it.name)+'</div></div></div>';
-    }).join('')+'</div>':'';
+    }).join('')+pager+'</div>':'';
     return '<div class="rd-grow" id="rd-group-row-'+gi+'"><div class="rd-glabel" title="'+esc(g.label)+'">'+esc(g.label)+'('+g.items.length+')</div>'+
       '<div class="rd-gstrip">'+cards+'</div>'+
       '<button class="rd-gmore" onclick="rdToggleGroup('+gi+')">'+(exp?'收起':'展开')+'</button></div>'+rest;
@@ -1656,36 +2315,21 @@ function rdRenderGroups(){const grid=document.getElementById('rd-grid');
   rdFillThumbs(grid);
   rdPager(Math.ceil(groups.length/RD_PAGE_SIZE),
     '共 '+groups.length+' 组 / '+rdItems.length+' 本');}
+function rdTurnGroup(i,d){
+  const g=rdGroups()[i];if(!g)return;
+  const label=g.label;
+  const pages=Math.ceil(g.items.length/RD_PAGE_SIZE);
+  const cur=rdGroupPages[label]||0;
+  rdGroupPages[label]=Math.max(0,Math.min(cur+d,pages-1));
+  rdRenderGroups();
+}
 function rdToggleGroup(i){
   const g=rdGroups()[i];
   if(!g)return;
   const label=g.label;
-  const row=document.getElementById('rd-group-row-'+i);
-  if(!row){rdRenderGroups();return}
-  const btn=row.querySelector('.rd-gmore');
-  const old=document.getElementById('rd-group-expand-'+i);
-  if(rdExpanded.has(label)){
-    rdExpanded.delete(label);
-    if(old)old.remove();
-    if(btn)btn.textContent='展开';
-    return;
-  }
-  rdExpanded.add(label);
-  if(btn)btn.textContent='收起';
-  if(old){old.style.display='';if(btn)btn.textContent='收起';return}
-  const div=document.createElement('div');
-  div.className='rd-gexpand';div.id='rd-group-expand-'+i;
-  const prevSrc=rdCaptureSrc(document.getElementById('rd-grid'));
-  div.innerHTML=g.items.map(it=>{
-    const idx=rdItems.indexOf(it);
-    const open=it.open_name||it.name;
-    return '<div class="rd-card">'+
-      '<img class="rd-thumb" style="cursor:pointer" onclick="rdOpen('+idx+')" alt="" data-name="'+esc(open)+'" data-size="'+it.size+'"'+rdSrcAttr(prevSrc,open)+'>'+
-      '<div class="rd-meta rd-meta-btn" onclick="rdShowDetail('+idx+')">'+
-      '<div class="rd-name">'+esc(it.title_original||it.title||it.name)+'</div></div></div>';
-  }).join('');
-  row.after(div);
-  rdFillThumbs(div);
+  if(rdExpanded.has(label))rdExpanded.delete(label);
+  else rdExpanded.add(label);
+  rdRenderGroups();
 }
 function rdCaptureSrc(root){const m={};
   root.querySelectorAll('img[data-name]').forEach(el=>{
@@ -1693,17 +2337,25 @@ function rdCaptureSrc(root){const m={};
     if(src)m[el.dataset.name]=src;
   });return m}
 function rdSrcAttr(prev,key){return prev&&prev[key]?' src="'+esc(prev[key])+'"':''}
-function rdFillThumbs(root){let k=0;
+const THUMB_PORT=__THUMB_PORT__;
+function thumbUrl(name,size){
+  return 'http://'+location.hostname+':'+THUMB_PORT+
+    '/api/reader/thumb?'+new URLSearchParams({
+      name:name,size:size,src_dir:rdDir()});
+}
+function rdFillThumbs(root){let k=0;let timer=null;
   const imgs=[...root.querySelectorAll('img[data-name]')];
   function next(){
+    if(document.getElementById('reader-modal').classList.contains('show')){
+      timer=setTimeout(next,600);return;
+    }
     if(k>=imgs.length)return;
     const img=imgs[k++];
     if(img.getAttribute('src'))return next();
-    img.src='/api/reader/thumb?'+new URLSearchParams({
-      name:img.dataset.name,size:img.dataset.size,src_dir:rdDir()});
-    img.onerror=()=>{img.style.background='#f8f8f8'};
+    img.src=thumbUrl(img.dataset.name,img.dataset.size);
+    img.onerror=()=>{img.style.background='#f8f8f8';next()};
     img.onload=next;
-    setTimeout(next,600);
+    timer=setTimeout(next,600);
   }next()}
 function rdRenderView(){const v=rdViewMode();
   const grid=document.getElementById('rd-grid');
@@ -1882,7 +2534,7 @@ function rdConditions(){
   return out;
 }
 function rdLoad(force){
-  rdListPage=0; rdExpanded.clear();
+  rdListPage=0; rdExpanded.clear(); rdGroupPages={};
   const v=rdViewMode(); const sel=document.getElementById('rd-view');
   if(sel)sel.value=v;
   const sortSel=document.getElementById('rd-sort');
@@ -1919,7 +2571,7 @@ function rdPager(totalPages,countDesc){
     '<button class="outline" onclick="rdTurn(-1)"'+(rdListPage<=0?' disabled':'')+'>上页</button> '+
     '<span style="font-size:12px;color:#666;margin:0 8px">'+(rdListPage+1)+' / '+totalPages+' ('+countDesc+')</span> '+
     '<button class="outline" onclick="rdTurn(1)"'+(rdListPage>=totalPages-1?' disabled':'')+'>下页</button>'}
-function rdTurn(d){rdListPage+=d;rdExpanded.clear();rdRenderView();
+function rdTurn(d){rdListPage+=d;rdExpanded.clear();rdGroupPages={};rdRenderView();
   window.scrollTo({top:document.getElementById('rd-grid').offsetTop,behavior:'instant'})}
 function rdRenderGrid(){
   rdApplyCols();
@@ -1943,6 +2595,8 @@ function rdRenderGrid(){
 }
 function rdOpen(i){
   rdView=rdItems[i];
+  clientLog('RD_OPEN_BEGIN',{i:i,name:rdView.open_name||rdView.name,
+    size:rdView.size||0,src_dir:rdDir()});
   // 点开就立刻进全屏, 不等 pages 接口: 首屏先给个轻量加载提示
   history.pushState({mangaReader:1},'');rdHistoryPushed=true;
   document.documentElement.classList.add('rd-open');
@@ -1954,17 +2608,24 @@ function rdOpen(i){
     (RD_MODES.find(m=>m[0]===rdMode())||RD_MODES[0])[1];
   const opened=rdView;
   // 首帧直接用已缓存的缩略图(后台预热过, 本地秒出), 不等整包下载
-  const thumb='/api/reader/thumb?'+new URLSearchParams({
-    name:opened.open_name||opened.name,size:opened.size||0,src_dir:rdDir()});
+  const thumb=thumbUrl(opened.open_name||opened.name,opened.size||0);
   document.getElementById('rd-stage').innerHTML=
-    '<img src="'+thumb+'" style="max-width:100%;max-height:100%;object-fit:contain">';
-  fetch('/api/reader/pages?'+new URLSearchParams({name:opened.open_name||opened.name,src_dir:rdDir(),size:opened.size||0}))
-    .then(r=>r.json()).then(d=>{
+    '<img src="'+esc(thumb)+'" style="max-width:100%;max-height:100%;object-fit:contain" data-manga="'+esc(opened.open_name||opened.name)+'" data-thumb="1">';
+  clientLog('RD_OPEN_THUMB',{src:thumb});
+  const pagesUrl='/api/reader/pages?'+new URLSearchParams({
+    name:opened.open_name||opened.name,src_dir:rdDir(),size:opened.size||0});
+  clientLog('RD_PAGES_FETCH',{url:pagesUrl});
+  fetch(pagesUrl)
+    .then(r=>{clientLog('RD_PAGES_RESPONSE',{status:r.status,ok:r.ok});return r.json()})
+    .then(d=>{
+      clientLog('RD_PAGES_JSON',{error:d.error||null,pages:Array.isArray(d.pages)?d.pages.length:null,
+        first:(d.pages&&d.pages[0])||null});
       if(d.error){alert(d.error);rdClose();return;}
-      if(rdView!==opened)return;
+      if(rdView!==opened){clientLog('RD_PAGES_STALE',{});return;}
       rdView.pages=d.pages;rdPageIdx=0;
       rdRenderPage();
-    });
+    })
+    .catch(e=>clientLog('RD_PAGES_FAIL',{error:String(e)}));
 }
 // 翻页模式: 'lr' 左到右(左=上一页), 'rl' 右到左(右=上一页), 'scroll' 上下连续
 const RD_MODES=[['lr','→→'],['rl','←←'],['scroll','↕↕']];
@@ -1991,29 +2652,43 @@ function rdRenderPage(){
   // seq 防止快速连点时旧页的回调覆盖新页
   const seq=(rdPageReq||0)+1;rdPageReq=seq;
   const url=rdPageUrl(rdView.pages[rdPageIdx]);
+  const context={seq:seq,idx:rdPageIdx,entry:rdView.pages[rdPageIdx],
+    name:rdView.open_name||rdView.name,url:url};
+  clientLog('RD_RENDER_BEGIN',context);
   const apply=()=>{
-    if(rdPageReq!==seq)return;
+    if(rdPageReq!==seq){clientLog('RD_RENDER_STALE',context);return;}
     let img=stage.querySelector('img');
     if(!img||img.dataset.manga!==(rdView.open_name||rdView.name)){
       stage.innerHTML='<img data-manga="'+esc(rdView.open_name||rdView.name)+'">';
       img=stage.querySelector('img');
     }
     if(img.getAttribute('src')!==url)img.src=url;
+    clientLog('RD_RENDER_APPLY',Object.assign({},context,{src:img.getAttribute('src')}));
   };
-  // 关键: 先判断浏览器缓存里是否已有这张图。命中就直接换现有 img 的 src,
-  // 同帧出图, 绝不重建元素 —— 重建 img 才会闪黑。
-  const pre=new Image();
-  pre.onload=apply;pre.onerror=apply;pre.src=url;
-  if(pre.complete&&(pre.naturalWidth>0||pre.naturalHeight>0)){
-    apply();
-  }else{
-    // 真要等网络: 清掉旧图, 不用旧页冒充新页; 加载好由 apply 填入
-    stage.innerHTML='<img data-manga="'+esc(rdView.open_name||rdView.name)+'" data-seq="'+seq+'">';
+  // 让可见 img 自己加载：onload 前保留缩略图，绝不在等待期间清空成黑屏。
+  let img=stage.querySelector('img');
+  if(!img||img.dataset.manga!==(rdView.open_name||rdView.name)){
+    stage.innerHTML='<img data-manga="'+esc(rdView.open_name||rdView.name)+'">';
+    img=stage.querySelector('img');
   }
-  // 顺手预加载前后各一页(只填浏览器缓存, 不改当前显示)
-  [rdPageIdx-1,rdPageIdx+1].forEach(n=>{
-    if(n>=0&&n<rdView.pages.length){const p=new Image();p.src=rdPageUrl(rdView.pages[n])}
-  });
+  img.dataset.seq=String(seq);
+  img.onload=()=>{
+    clientLog('RD_IMG_LOADED',Object.assign({},context,
+      {w:img.naturalWidth,h:img.naturalHeight,src:img.getAttribute('src')}));
+    apply();
+  };
+  img.onerror=()=>clientLog('RD_IMG_ERROR',Object.assign({},context,
+    {src:img.getAttribute('src')}));
+  if(img.getAttribute('src')!==url){
+    clientLog('RD_IMG_SET_SRC',context);
+    img.src=url;
+  }else{
+    clientLog('RD_IMG_SRC_SAME',context);
+    apply();
+  }
+  // 顺手预加载后一页(只填浏览器缓存, 不改当前显示)
+  const next=rdPageIdx+1;
+  if(next<rdView.pages.length){const p=new Image();p.src=rdPageUrl(rdView.pages[next])}
   stage.scrollTop=0;
   document.getElementById('rd-page-no').textContent=
     (rdPageIdx+1)+' / '+rdView.pages.length;
@@ -2215,6 +2890,9 @@ function pollScan(){
             st.textContent='完成 ✓ 成功'+s.done+' 失败'+s.fail+
               ' 跳过'+s.skip+' 耗时'+(s.elapsed||0).toFixed(0)+'s';
             st.style.color='';
+          }
+          if(s.duplicate_candidates&&s.duplicate_candidates.length){
+            showDupModal(s.duplicate_candidates);
           }
         }
       }
@@ -2958,10 +3636,14 @@ class Handler(BaseHTTPRequestHandler):
     def _html(self, html):
         # 页面里的路径占位符换成实际值(DB 路径随运行位置变)
         html = html.replace("__DB_PATH__", _attr_escape(DB_PATH))
+        html = html.replace("__THUMB_PORT__", str(THUMB_PORT))
         body = html.encode("utf-8")
         write_api_log("RESP_HTML", {"path": self.path, "bytes": len(body)})
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -3028,6 +3710,9 @@ class Handler(BaseHTTPRequestHandler):
             name = qs.get("name", [""])[0]
             self._json(API.detail(name))
             return
+        if path == "/api/upload/status":
+            self._json(API.upload_status(qs.get("id", [""])[0]))
+            return
         if path == "/api/scan/current":
             active = [sid for sid, w in SCAN_WORKERS.items() if w.get("running")]
             self._json({"scan_id": active[-1] if active else None,
@@ -3085,7 +3770,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/reader/thumb":
             name = qs.get("name", [""])[0]
             src_dir = qs.get("src_dir", [""])[0]
-            got = API.reader_thumb(name, qs.get("size", ["0"])[0], src_dir)
+            size = qs.get("size", ["0"])[0]
+            got = THUMB_POOL.submit(API.reader_thumb, name, size, src_dir).result(timeout=40)
             if not got:
                 self.send_error(404)
                 return
@@ -3115,6 +3801,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         write_api_log("REQ_POST", {"path": path, "body": body})
 
+        if path == "/api/client/log":
+            flush_client_logs()
+            info = body.get("data") if isinstance(body.get("data"), dict) else {}
+            write_api_log("CLIENT", {"stage": body.get("stage"),
+                                     "t": body.get("t"), "data": info})
+            self._json({"ok": True})
+            return
         if path == "/api/scan":
             dirs = [d.strip() for d in body.get("dirs", "").split(",") if d.strip()]
             db = body.get("db", DB_PATH)
@@ -3128,6 +3821,74 @@ class Handler(BaseHTTPRequestHandler):
                                     "dirs": dirs, "rescan": rescan,
                                     "recursive": recursive})
             self._json(result)
+            return
+        if path == "/api/upload/prepare":
+            result = API.upload_prepare(
+                body.get("local_dir", ""), bool(body.get("recursive", False)),
+                body.get("target_root", ""), body.get("compare_root", ""))
+            self._json(result)
+            return
+        if path == "/api/upload/start":
+            result = API.upload_start(body.get("plan_id", ""))
+            self._json(result)
+            return
+        if path == "/api/upload/delete":
+            paths = body.get("paths", [])
+            if not isinstance(paths, list) or not paths:
+                self._json({"error": "没有要删除的文件"})
+                return
+            ok, fail, results = 0, 0, []
+            for full in paths:
+                full = str(full).strip()
+                if not full:
+                    continue
+                try:
+                    os.remove(full)
+                    ok += 1
+                    results.append((full, "ok", "已删除"))
+                except Exception as ex:
+                    fail += 1
+                    results.append((full, "fail", str(ex)[:200]))
+            write_op_log("确认删除上传重复文件", {"ok": ok, "fail": fail,
+                                          "paths": paths})
+            self._json({"ok": ok, "fail": fail, "results": results})
+            return
+        if path == "/api/duplicates/delete":
+            paths = body.get("paths", [])
+            if not isinstance(paths, list) or not paths:
+                self._json({"error": "没有要删除的文件"})
+                return
+            ok, fail, results = 0, 0, []
+            for full in paths:
+                full = str(full).strip()
+                if not full:
+                    continue
+                try:
+                    if src_layer.is_remote(full):
+                        root, rel = os.path.split(full)
+                        root = root.rstrip("/")
+                        if not root or not rel:
+                            fail += 1
+                            results.append((full, "fail", "路径错误"))
+                            continue
+                        s = src_layer.get_source(root)
+                        ret, msg = s.delete(rel)
+                        if ret == "ok":
+                            ok += 1
+                            results.append((full, "ok", msg))
+                        else:
+                            fail += 1
+                            results.append((full, "fail", msg))
+                    else:
+                        os.remove(full)
+                        ok += 1
+                        results.append((full, "ok", "已删除"))
+                except Exception as ex:
+                    fail += 1
+                    results.append((full, "fail", str(ex)[:200]))
+            write_op_log("确认删除重复文件", {"ok": ok, "fail": fail,
+                                       "paths": paths})
+            self._json({"ok": ok, "fail": fail, "results": results})
             return
         if path == "/api/classify":
             write_op_log("开始分类整理", {"names_count": len(body.get("names", []))})
@@ -3226,11 +3987,16 @@ def main():
     class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True
     server = ThreadedHTTPServer(("0.0.0.0", PORT), Handler)
+    thumb_server = ThreadedHTTPServer(("0.0.0.0", THUMB_PORT), Handler)
+    threading.Thread(target=thumb_server.serve_forever,
+                     name="thumb-http-server", daemon=True).start()
+    print(f"缩略图独立端口: {THUMB_PORT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n已停止")
         server.shutdown()
+        thumb_server.shutdown()
 
 
 if __name__ == "__main__":

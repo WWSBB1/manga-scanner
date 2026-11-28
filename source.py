@@ -43,6 +43,8 @@ from datetime import datetime
 HTTP_LIST_TIMEOUT = 300
 HTTP_OP_TIMEOUT = 60
 HTTP_TIMEOUT = HTTP_OP_TIMEOUT      # 兼容旧引用
+HTTP_UPLOAD_TIMEOUT = 600
+RANGE_CHUNK = 100 * 1024            # Range 起步 100KB，不够再按 100KB 叠加
 
 # 远程解析的并发度。实测(123 云盘 WebDAV, 2026-10-24):
 #   * 并发 2 跑几十个没问题, 但连续读一大批后服务端开始限流,
@@ -506,6 +508,26 @@ class WebDavHttpSource(Source):
         except Exception as e:
             return "fail", str(e)[:200]
 
+    def upload(self, rel, local_path):
+        """把本地文件上传到 WebDAV 远程路径。"""
+        logging.getLogger("source").info("WEBDAV_UPLOAD_BEGIN rel=%s local=%s bytes=%s",
+                                         rel, local_path, os.path.getsize(local_path))
+        fh = open(local_path, "rb")
+        try:
+            req = urllib.request.Request(self._full_url(rel), headers={
+                "Authorization": self._auth,
+                "Content-Type": "application/zip",
+                "Content-Length": str(os.path.getsize(local_path)),
+            }, data=fh, method="PUT")
+            r = self._opener.open(req, timeout=HTTP_UPLOAD_TIMEOUT)
+            r.read(256)
+            return "ok", f"HTTP {r.status}"
+        except Exception as e:
+            logging.getLogger("source").error("WEBDAV_UPLOAD_FAIL rel=%s err=%s", rel, e)
+            return "fail", str(e)[:200]
+        finally:
+            fh.close()
+
     def delete(self, rel):
         """删除远程文件(WebDAV DELETE)。"""
         logging.getLogger("source").info("WEBDAV_DELETE rel=%s", rel)
@@ -567,7 +589,7 @@ class WebDavRangeFile:
             off = self.pos - self._start
             out = self._buf[off:off+n]; self.pos = end; return out
         start = self.pos
-        want = min(max(n, 1024 * 1024), self.size - start)
+        want = min(max(n, RANGE_CHUNK), self.size - start)
         stop = min(self.size, start + want) - 1
         req = urllib.request.Request(self.url, headers={
             "Authorization": self.auth,
