@@ -17,6 +17,9 @@ import zipfile
 import threading
 import time
 import concurrent.futures
+import functools
+import gzip
+import hashlib
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
@@ -186,6 +189,213 @@ def remote_note(path):
     return {"remote": True, "supports_copy": False,
             "note": "远程模式: 仅支持移动, 不支持复制(123 云盘 WebDAV "
                     "的 COPY 返回 500)"}
+
+
+# ================================================================ Reader 快照
+# 阅读页数据源快照: 同一目录+子目录开关只构造一次。
+# 目录/元数据变化由 invalidate_reader_snapshot() 主动失效。
+READER_SNAPSHOTS = {}          # key -> {"items": [...], "in_dir": int, "at": float}
+READER_SNAPSHOT_LOCK = threading.Lock()
+READER_VIEW_CACHE = {}         # key -> {"items": [...], "groups": [...]}
+READER_VIEW_LOCK = threading.Lock()
+
+
+def _reader_cache_files_for(src_dir):
+    """返回该目录(含子目录开关)的所有磁盘快照文件。"""
+    try:
+        base = os.path.join(BASE, "manga_cache", "reader_snapshots")
+        if not os.path.isdir(base):
+            return []
+        raw = src_dir.rstrip("/")
+        h = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
+        return [os.path.join(base, h + ".json.gz"),
+                os.path.join(base, h + "_sub.json.gz")]
+    except Exception:
+        return []
+
+
+def invalidate_reader_snapshot(src_dir=None):
+    """数据变化后调用: 直接删除相关磁盘缓存 + 清内存。
+
+    src_dir 为受影响路径: 清掉所有与它相交的 reader 快照。
+    - None: 全部清
+    - 有值: 缓存目录 == 它 / 在它下面 / 它的父目录含它, 都清
+    """
+    with READER_SNAPSHOT_LOCK:
+        with READER_VIEW_LOCK:
+            READER_VIEW_CACHE.clear()
+        if src_dir is None:
+            READER_SNAPSHOTS.clear()
+            try:
+                base = os.path.join(BASE, "manga_cache", "reader_snapshots")
+                if os.path.isdir(base):
+                    for fn in os.listdir(base):
+                        if fn.endswith(".json.gz"):
+                            try: os.remove(os.path.join(base, fn))
+                            except OSError: pass
+            except Exception:
+                pass
+            return
+        changed = str(src_dir).rstrip("/")
+        for k in list(READER_SNAPSHOTS):
+            cache_dir = k.split("|", 1)[0].rstrip("/")
+            if (cache_dir == changed
+                    or cache_dir.startswith(changed + "/")
+                    or changed.startswith(cache_dir + "/")):
+                READER_SNAPSHOTS.pop(k, None)
+        # 删除可能相关的磁盘缓存文件
+        try:
+            base = os.path.join(BASE, "manga_cache", "reader_snapshots")
+            if os.path.isdir(base):
+                for fn in os.listdir(base):
+                    if not fn.endswith(".json.gz"):
+                        continue
+                    # 粗暴但可靠: 删除所有快照, 下次按需重建
+                    try: os.remove(os.path.join(base, fn))
+                    except OSError: pass
+        except Exception:
+            pass
+
+
+def _reader_natural_key(s):
+    """与前端 rdNatural 等价的自然排序键。数字段按数值比较。"""
+    parts = re.split(r"(\d+)", str(s or ""))
+    key = []
+    for p in parts:
+        pf = p.strip()
+        if pf.isdecimal():  # 上标数字 ⁹ 的 isdigit() 为 True 但 int() 会炸
+            key.append((1, int(pf), ""))
+        else:
+            key.append((0, 0, p.lower()))
+    return key
+
+
+def _reader_split(raw, field):
+    """与前端 rdSplit 等价。"""
+    out, seen = [], set()
+    for part in re.split(r"[,，]", str(raw or "")):
+        v = part.strip()
+        if not v or v.lower() == "unknown" or v in seen:
+            continue
+        if field == "parody" and v.lower() == "original":
+            continue
+        seen.add(v)
+        out.append(v)
+    return out
+
+
+def _reader_match(it, cond):
+    """与前端 match 等价。"""
+    f = cond.get("field")
+    op = cond.get("op") or "contains"
+    v = str(cond.get("value") or "")
+    vals = [str(it.get(f) or "")]
+    if f == "title":
+        vals += [str(it.get("title_original") or ""), str(it.get("name") or "")]
+    vals = [x for x in vals if x]
+    low = v.lower()
+    hit = any(low in x.lower() for x in vals)
+    if op == "contains": return hit
+    if op == "not_contains": return not hit
+    if op == "eq": return any(low == x.lower() for x in vals)
+    if op == "ne": return not any(low == x.lower() for x in vals)
+    if op == "empty": return not vals
+    if op == "not_empty": return bool(vals)
+    return True
+
+
+def _reader_sort_items(items, sort_mode, order):
+    sign = 1 if order == "asc" else -1
+
+    def date_key(it):
+        try: y = int(it.get("year") or 0)
+        except Exception: y = 0
+        try: m = int(it.get("month") or 0)
+        except Exception: m = 0
+        try: d = int(it.get("day") or 0)
+        except Exception: d = 0
+        return y * 10000 + m * 100 + d
+
+    def cmp(a, b):
+        if sort_mode == "date":
+            c = date_key(a) - date_key(b)
+            if c: return sign * c
+        elif sort_mode == "pages":
+            try: pa = int(a.get("page_count") or 0)
+            except Exception: pa = 0
+            try: pb = int(b.get("page_count") or 0)
+            except Exception: pb = 0
+            c = pa - pb
+            if c: return sign * c
+        ka, kb = _reader_natural_key(a.get("name")), _reader_natural_key(b.get("name"))
+        if ka != kb: return sign * (1 if ka > kb else -1)
+        return 0
+    items.sort(key=functools.cmp_to_key(cmp))
+    return items
+
+
+def _reader_build_base_items(src_dir, subdirs, force=False):
+    """从目录清单 + 元数据构造全量 items(只做一次,之后复用)。"""
+    from copy import deepcopy
+    # 复用原 reader_list 的取目录+元数据逻辑: 调一次大 limit, 且不传筛选条件
+    data = API.reader_list(src_dir, [], "and", scope="all", limit=100000,
+                           force=force, subdirs=subdirs)
+    if data.get("error"):
+        return data
+    items = data.get("items") or []
+    return {"items": items, "in_dir": int(data.get("in_dir") or 0)}
+
+
+def _reader_snapshot_cache_path(src_dir, subdirs):
+    base = os.path.join(BASE, "manga_cache", "reader_snapshots")
+    raw = src_dir.rstrip("/") + "|" + ("1" if subdirs else "0")
+    h = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
+    return os.path.join(base, h + ".json.gz")
+
+
+def _reader_snapshot_load_disk(path):
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _reader_snapshot_save_disk(path, snap):
+    try:
+        d = os.path.dirname(path)
+        os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=4) as f:
+            json.dump(snap, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _reader_get_snapshot(src_dir, subdirs, force=False):
+    key = src_dir.rstrip("/") + "|" + ("1" if subdirs else "0")
+    with READER_SNAPSHOT_LOCK:
+        if not force and key in READER_SNAPSHOTS:
+            return dict(READER_SNAPSHOTS[key])
+    cache_path = _reader_snapshot_cache_path(src_dir, subdirs)
+    if not force:
+        snap = _reader_snapshot_load_disk(cache_path)
+        if snap is not None:
+            with READER_SNAPSHOT_LOCK:
+                READER_SNAPSHOTS[key] = snap
+            return dict(snap)
+    snap = _reader_build_base_items(src_dir, subdirs, force=force)
+    if snap.get("error"):
+        return snap
+    snap["at"] = time.time()
+    _reader_snapshot_save_disk(cache_path, snap)
+    with READER_SNAPSHOT_LOCK:
+        READER_SNAPSHOTS[key] = snap
+    return dict(snap)
 
 
 # ================================================================ API
@@ -432,6 +642,8 @@ class API:
             finally:
                 progress("完成", UPLOAD_WORKERS[uid]["progress"]["total"],
                          UPLOAD_WORKERS[uid]["progress"]["total"], "")
+                if result.get("ok"):
+                    invalidate_reader_snapshot(plan.get("target_root"))
                 UPLOAD_WORKERS[uid]["result"] = result
                 UPLOAD_WORKERS[uid]["running"] = False
                 write_op_log("上传结束", {"upload_id": uid,
@@ -522,6 +734,15 @@ class API:
                     LAST_SCAN["db"] = os.path.abspath(db)
                     LAST_SCAN["dirs"] = list(dirs)
                     LAST_SCAN["at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    for d in dirs:
+                        invalidate_reader_snapshot(d)
+                    # 扫描完成后提前构建 reader 快照, 避免首次打开阅读页再构建
+                    for d in dirs:
+                        for subdirs in (False, True):
+                            try:
+                                _reader_get_snapshot(d, subdirs, force=False)
+                            except Exception:
+                                pass
             except Exception as ex:
                 w["stats"] = {"error": str(ex)}
             finally:
@@ -593,6 +814,103 @@ class API:
         if any(part in ("", ".", "..") for part in parts):
             return None
         return name
+
+    @staticmethod
+    def reader_view(src_dir, conditions, join, subdirs, force, view, sort,
+                    order, page, expanded_labels=None, group_pages=None):
+        """阅读页统一视图接口: 后端筛选/排序/分组/分页。
+
+        视图结果也缓存: 同条件/排序/视图只处理一次, 翻页只切片。
+        """
+        try:
+            if not src_dir or not dir_usable(src_dir):
+                return {"error": "请填有效的漫画目录(本地路径或 WebDAV 远程路径)"}
+            snap = _reader_get_snapshot(src_dir, bool(subdirs), bool(force))
+            if snap.get("error"):
+                return snap
+
+            view_key = json.dumps(
+                [src_dir.rstrip("/"), bool(subdirs), conditions or [], join,
+                 view, sort or "date", order or "desc"],
+                ensure_ascii=False, sort_keys=True)
+            if force:
+                with READER_VIEW_LOCK:
+                    READER_VIEW_CACHE.pop(view_key, None)
+            with READER_VIEW_LOCK:
+                prepared = READER_VIEW_CACHE.get(view_key)
+            if prepared is None:
+                items = [dict(x) for x in snap["items"]]
+                conds = [c for c in (conditions or [])
+                         if (str((c or {}).get("value") or "").strip()
+                             or (c or {}).get("op") in ("empty", "not_empty"))]
+                if conds:
+                    items = [it for it in items if (
+                        all(_reader_match(it, c) for c in conds) if join == "and"
+                        else any(_reader_match(it, c) for c in conds))]
+                _reader_sort_items(items, sort or "date", order or "desc")
+                for idx, it in enumerate(items):
+                    it["_idx"] = idx
+                prepared = {"items": items}
+                if view != "grid":
+                    groups_map = {}
+                    for it in items:
+                        vals = _reader_split(it.get(view), view)
+                        for label in (vals or ["未分类"]):
+                            groups_map.setdefault(label, []).append(it)
+                    groups = []
+                    for label, arr in groups_map.items():
+                        groups.append({"label": label, "count": len(arr), "items": arr})
+                    groups.sort(key=lambda g: (
+                        1 if g["label"] == "未分类" else 0,
+                        -g["count"],
+                        _reader_natural_key(g["label"])))
+                    prepared["groups"] = groups
+                with READER_VIEW_LOCK:
+                    READER_VIEW_CACHE[view_key] = prepared
+
+            items = prepared["items"]
+            page = max(0, int(page or 0))
+            page_size = 30
+            result = {"in_dir": snap["in_dir"], "total": len(items), "page": page}
+
+            if view == "grid":
+                pages = max(1, (len(items) + page_size - 1) // page_size)
+                page = min(page, pages - 1)
+                start = page * page_size
+                result.update({"mode": "grid", "page": page, "pages": pages,
+                               "count": min(page_size, max(0, len(items)-start)),
+                               "items": items[start:start + page_size]})
+                return result
+
+            groups = prepared.get("groups") or []
+            pages = max(1, (len(groups) + page_size - 1) // page_size)
+            page = min(page, pages - 1)
+            start = page * page_size
+            page_groups = groups[start:start + page_size]
+            expanded = set(expanded_labels or [])
+            gp_map = group_pages or {}
+            out_groups = []
+            for g in page_groups:
+                label = g["label"]
+                arr = g["items"]
+                exp = label in expanded
+                try: gp = max(0, int(gp_map.get(label, 0)))
+                except Exception: gp = 0
+                gpages = max(1, (len(arr) + page_size - 1) // page_size)
+                gp = min(gp, gpages - 1)
+                if exp:
+                    gstart = gp * page_size
+                    show = arr[gstart:gstart + page_size]
+                else:
+                    show = arr[:10]
+                out_groups.append({"label": label, "count": len(arr),
+                                   "expanded": exp, "group_page": gp,
+                                   "group_pages": gpages, "items": show})
+            result.update({"mode": "group", "page": page, "pages": pages,
+                           "groups": out_groups, "total_groups": len(groups)})
+            return result
+        except Exception as ex:
+            return {"error": str(ex)}
 
     @staticmethod
     def reader_list(src_dir, conditions, join="and", scope="scan", limit=200,
@@ -2076,7 +2394,6 @@ function upDeleteAll(){
       alert('删除完成: 成功 '+(d.ok||0)+' 失败 '+(d.fail||0));
     });
 }
-function upV(id){const e=document.getElementById(id);return e?e.value.trim():''}
 function upPrepare(){
   const body={local_dir:upV('up-local'),recursive:document.getElementById('up-recursive').checked,
     target_root:upV('up-target'),compare_root:upV('up-compare')};
@@ -2225,6 +2542,8 @@ const RD_FIELDS={tags:'标签',artist:'作者',group_name:'社团',parody:'原�
 let rdFavs=JSON.parse(localStorage.getItem('manga_rd_favs')||'[]');
 let rdSel=[], rdItems=[], rdView=null, rdPageIdx=0, rdQuickTimer=null, rdHistoryPushed=false, rdDelTimer=null, rdManageFavs=false;
 let rdExpanded=new Set(), rdGroupPages={}, rdListPage=0, rdDirTotal=0, rdPageReq=0, rdLoaded=false, rdLoadedKey="";
+let rdRenderMeta=null;
+let rdViewReq=0;
 const RD_PAGE_SIZE=30;
 function rdSortMode(){const el=document.getElementById('rd-sort');
   const v=el?el.value:(localStorage.getItem('manga_rd_sort')||'date');
@@ -2234,7 +2553,7 @@ function rdOrder(){const el=document.getElementById('rd-order');
   return v==='asc'?'asc':'desc'}
 function rdChangeSort(){localStorage.setItem('manga_rd_sort',rdSortMode());
   localStorage.setItem('manga_rd_order',rdOrder());
-  rdListPage=0;rdExpanded.clear();rdGroupPages={};rdSortItems();rdRenderView()}
+  rdListPage=0;rdExpanded.clear();rdGroupPages={};rdLoad()}
 function rdItemCmp(a,b){const mode=rdSortMode(), sign=rdOrder()==='asc'?1:-1;
   const dateKey=it=>{const y=Number(it.year)||0,m=Number(it.month)||0,d=Number(it.day)||0;
     return y*10000+m*100+d};
@@ -2246,7 +2565,7 @@ function rdSortItems(){rdItems.sort(rdItemCmp)}
 function rdViewMode(){const v=localStorage.getItem('manga_rd_view')||'grid';
   return document.getElementById('rd-view')&&v!=='grid'?v:'grid'}
 function rdChangeView(){const v=document.getElementById('rd-view').value;
-  localStorage.setItem('manga_rd_view',v);rdExpanded.clear();rdGroupPages={};rdRenderView()}
+  localStorage.setItem('manga_rd_view',v);rdExpanded.clear();rdGroupPages={};rdListPage=0;rdLoad()}
 function rdNatural(a,b){const re=/(\d+)/g,A=String(a).split(re),B=String(b).split(re);
   for(let i=0;i<Math.min(A.length,B.length);i++){
     const x=A[i],y=B[i];
@@ -2268,68 +2587,60 @@ function rdGroups(){const field=rdViewMode();const map={};
   return Object.keys(map).sort((a,b)=>
     a==='未分类'?1:b==='未分类'?-1:map[b].length-map[a].length||rdNatural(a,b))
     .map(label=>({label,items:map[label].sort(rdItemCmp)}))}
-function rdRenderGroups(){const grid=document.getElementById('rd-grid');
-  // 分组模式: 一组一行, 不受"每行 2/3/4 本"影响
-  grid.classList.remove('rd-grid');grid.style.gridTemplateColumns='';
-  grid.classList.add('rd-group-list');
-  const groups=rdGroups();
+function rdRenderGroups(){
+  const grid=document.getElementById('rd-grid');
+  grid.classList.remove('rd-grid');grid.style.gridTemplateColumns='';grid.classList.add('rd-group-list');
   const prevSrc=rdCaptureSrc(grid);
+  const groups=(rdRenderMeta&&rdRenderMeta.groups)||[];
+  rdItems=[];
   const openSet={};
-  const start=rdListPage*RD_PAGE_SIZE;
-  const pageGroups=groups.slice(start,start+RD_PAGE_SIZE);
-  grid.innerHTML=pageGroups.map((g,i)=>{
-    const gi=start+i;
-    const exp=rdExpanded.has(g.label);
-    const gp=rdGroupPages[g.label]||0;
-    const gStart=gp*RD_PAGE_SIZE;
-    const gItems=exp?g.items.slice(gStart,gStart+RD_PAGE_SIZE):g.items.slice(0,10);
+  grid.innerHTML=groups.map((g,i)=>{
+    g.items.forEach(it=>{it._ui=rdItems.length;rdItems.push(it)});
+    const exp=!!g.expanded;
+    const gp=g.group_page||0;
+    const gItems=g.items||[];
     const cards=gItems.map(it=>{
-      const idx=rdItems.indexOf(it);
       const open=it.open_name||it.name;
       const src=rdSrcAttr(prevSrc,open);
       if(src)openSet[open]=prevSrc[open];
       return '<div class="rd-gcard">'+
-        '<img alt="" onclick="rdOpen('+idx+')" data-name="'+esc(open)+'" data-size="'+it.size+'"'+src+'>'+
-        '<div class="rd-gname rd-meta-btn" onclick="rdShowDetail('+idx+')">'+esc(it.title_original||it.title||it.name)+'</div></div>';
+        '<img alt="" onclick="rdOpen('+it._ui+')" data-name="'+esc(open)+'" data-size="'+it.size+'"'+src+'>'+
+        '<div class="rd-gname rd-meta-btn" onclick="rdShowDetail('+it._ui+')">'+esc(it.title_original||it.title||it.name)+'</div></div>';
     }).join('');
     let pager='';
-    if(exp&&g.items.length>RD_PAGE_SIZE){
-      const pages=Math.ceil(g.items.length/RD_PAGE_SIZE);
+    if(exp&&(g.group_pages||1)>1){
       pager='<div class="rd-gpager" style="padding:6px 10px;text-align:center">'+
-        '<button class="outline" onclick="rdTurnGroup('+gi+',-1)"'+(gp<=0?' disabled':'')+'>上页</button> '+
-        '<span style="font-size:12px;color:#666;margin:0 8px">'+(gp+1)+' / '+pages+'</span> '+
-        '<button class="outline" onclick="rdTurnGroup('+gi+',1)"'+(gp>=pages-1?' disabled':'')+'>下页</button></div>';
+        '<button class="outline" onclick="rdTurnGroup('+i+',-1)"'+(gp<=0?' disabled':'')+'>上页</button> '+
+        '<span style="font-size:12px;color:#666;margin:0 8px">'+(gp+1)+' / '+g.group_pages+'</span> '+
+        '<button class="outline" onclick="rdTurnGroup('+i+',1)"'+(gp>=g.group_pages-1?' disabled':'')+'>下页</button></div>';
     }
     const rest=exp?'<div class="rd-gexpand">'+gItems.map(it=>{
-      const idx=rdItems.indexOf(it);
       const open=it.open_name||it.name;
       return '<div class="rd-card">'+
-        '<img class="rd-thumb" style="cursor:pointer" onclick="rdOpen('+idx+')" alt="" data-name="'+esc(open)+'" data-size="'+it.size+'"'+rdSrcAttr(openSet,open)+'>'+
-        '<div class="rd-meta rd-meta-btn" onclick="rdShowDetail('+idx+')">'+
+        '<img class="rd-thumb" style="cursor:pointer" onclick="rdOpen('+it._ui+')" alt="" data-name="'+esc(open)+'" data-size="'+it.size+'"'+rdSrcAttr(openSet,open)+'>'+
+        '<div class="rd-meta rd-meta-btn" onclick="rdShowDetail('+it._ui+')">'+
         '<div class="rd-name">'+esc(it.title_original||it.title||it.name)+'</div></div></div>';
     }).join('')+pager+'</div>':'';
-    return '<div class="rd-grow" id="rd-group-row-'+gi+'"><div class="rd-glabel" title="'+esc(g.label)+'">'+esc(g.label)+'('+g.items.length+')</div>'+
+    return '<div class="rd-grow" id="rd-group-row-'+i+'"><div class="rd-glabel" title="'+esc(g.label)+'">'+esc(g.label)+'('+g.count+')</div>'+
       '<div class="rd-gstrip">'+cards+'</div>'+
-      '<button class="rd-gmore" onclick="rdToggleGroup('+gi+')">'+(exp?'收起':'展开')+'</button></div>'+rest;
+      '<button class="rd-gmore" onclick="rdToggleGroup('+i+')">'+(exp?'收起':'展开')+'</button></div>'+rest;
   }).join('')||'<div class="rd-loading">没有符合条件的漫画</div>';
   rdFillThumbs(grid);
-  rdPager(Math.ceil(groups.length/RD_PAGE_SIZE),
-    '共 '+groups.length+' 组 / '+rdItems.length+' 本');}
-function rdTurnGroup(i,d){
-  const g=rdGroups()[i];if(!g)return;
-  const label=g.label;
-  const pages=Math.ceil(g.items.length/RD_PAGE_SIZE);
-  const cur=rdGroupPages[label]||0;
-  rdGroupPages[label]=Math.max(0,Math.min(cur+d,pages-1));
-  rdRenderGroups();
+  const pages=(rdRenderMeta&&rdRenderMeta.pages)||1;
+  rdPager(pages,'共 '+((rdRenderMeta&&rdRenderMeta.total_groups)||0)+' 组 / '+((rdRenderMeta&&rdRenderMeta.total)||0)+' 本');
 }
 function rdToggleGroup(i){
-  const g=rdGroups()[i];
-  if(!g)return;
+  const g=(rdRenderMeta&&rdRenderMeta.groups&&rdRenderMeta.groups[i]);if(!g)return;
   const label=g.label;
-  if(rdExpanded.has(label))rdExpanded.delete(label);
-  else rdExpanded.add(label);
-  rdRenderGroups();
+  if(rdExpanded.has(label))rdExpanded.delete(label);else rdExpanded.add(label);
+  rdLoad(false,true);
+}
+function rdTurnGroup(i,d){
+  const g=(rdRenderMeta&&rdRenderMeta.groups&&rdRenderMeta.groups[i]);if(!g)return;
+  const label=g.label;
+  const cur=rdGroupPages[label]||0;
+  rdGroupPages[label]=Math.max(0,Math.min(cur+d,(g.group_pages||1)-1));
+  rdLoad(false,true);
 }
 function rdCaptureSrc(root){const m={};
   root.querySelectorAll('img[data-name]').forEach(el=>{
@@ -2423,7 +2734,7 @@ function dirHistPick(enc){const v=decodeURIComponent(enc);
   document.querySelectorAll('.rd-hist-pop').forEach(e=>e.style.display='none');
   if(!document.getElementById('page-read').classList.contains('hidden'))rdLoad();
 }
-function rdRefresh(){rdSaveOpts();rdDirHistPush(rdDir());rdLoad()}
+function rdRefresh(){rdSaveOpts();rdDirHistPush(rdDir());rdLoad(true)}
 function rdSaveFavs(){localStorage.setItem('manga_rd_favs',JSON.stringify(rdFavs))}
 function rdChipKey(f,v){return f+'\u0001'+v}
 function rdRenderFavs(){
@@ -2533,33 +2844,40 @@ function rdConditions(){
   });
   return out;
 }
-function rdLoad(force){
-  rdListPage=0; rdExpanded.clear(); rdGroupPages={};
-  const v=rdViewMode(); const sel=document.getElementById('rd-view');
-  if(sel)sel.value=v;
-  const sortSel=document.getElementById('rd-sort');
-  if(sortSel)sortSel.value=rdSortMode();
-  const orderSel=document.getElementById('rd-order');
-  if(orderSel)orderSel.value=rdOrder();
-  const body={src_dir:rdDir(),conditions:rdConditions(),
+function rdViewReqBody(force){
+  return {src_dir:rdDir(),conditions:rdConditions(),
     join:document.getElementById('rd-join').value,
-    scope:'all',limit:100000,force:!!force,
-    subdirs:!!document.getElementById('rd-subdirs')?.checked};
-  fetch('/api/reader/list',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify(body)}).then(r=>r.json()).then(d=>{
-      if(d.error||!Array.isArray(d.items)){
-        document.getElementById('rd-grid').innerHTML=
-          '<div class="rd-loading">'+esc(d.error||'接口返回格式错误')+'</div>';
+    subdirs:!!document.getElementById('rd-subdirs')?.checked,
+    force:!!force,view:rdViewMode(),sort:rdSortMode(),order:rdOrder(),
+    page:rdListPage,expanded:[...rdExpanded],group_pages:rdGroupPages};
+}
+function rdLoad(force,quiet){
+  const req=++rdViewReq;
+  const grid=document.getElementById('rd-grid');
+  fetch('/api/reader/view',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(rdViewReqBody(force))}).then(r=>r.json()).then(d=>{
+      if(req!==rdViewReq)return;
+      if(d.error||!d.mode){
+        grid.innerHTML='<div class="rd-loading">'+esc(d.error||'接口返回格式错误')+'</div>';
         return;
       }
-      rdItems=d.items; rdDirTotal=d.in_dir||0;
+      rdRenderMeta=d;
+      rdDirTotal=d.in_dir||0;
       rdLoaded=true;
       rdLoadedKey=rdDir()+'|'+(document.getElementById('rd-subdirs')?.checked?'1':'0');
-      rdSortItems();
       document.getElementById('rd-count').textContent=
-        d.items.length+' / 共 '+d.total+' 本 (目录里 '+d.in_dir+' 本)';
+        d.mode==='grid'?((d.count||0)+' / 共 '+d.total+' 本 (目录里 '+d.in_dir+' 本)'):
+        ((d.total_groups||0)+' 组 / '+d.total+' 本 (目录里 '+d.in_dir+' 本)');
       rdRenderView();
     });
+}
+function rdTurn(d){
+  const max=(rdRenderMeta&&rdRenderMeta.pages)?rdRenderMeta.pages:1;
+  const np=Math.max(0,Math.min(rdListPage+d,max-1));
+  if(np===rdListPage)return;
+  rdListPage=np;rdExpanded.clear();rdGroupPages={};
+  rdLoad(false,true);
+  window.scrollTo({top:document.getElementById('rd-grid').offsetTop,behavior:'instant'});
 }
 function rdApplyCols(){
   const n=parseInt(document.getElementById('rd-cols').value)||2;
@@ -2571,27 +2889,26 @@ function rdPager(totalPages,countDesc){
     '<button class="outline" onclick="rdTurn(-1)"'+(rdListPage<=0?' disabled':'')+'>上页</button> '+
     '<span style="font-size:12px;color:#666;margin:0 8px">'+(rdListPage+1)+' / '+totalPages+' ('+countDesc+')</span> '+
     '<button class="outline" onclick="rdTurn(1)"'+(rdListPage>=totalPages-1?' disabled':'')+'>下页</button>'}
-function rdTurn(d){rdListPage+=d;rdExpanded.clear();rdGroupPages={};rdRenderView();
-  window.scrollTo({top:document.getElementById('rd-grid').offsetTop,behavior:'instant'})}
 function rdRenderGrid(){
   rdApplyCols();
   const grid=document.getElementById('rd-grid');
   const prevSrc=rdCaptureSrc(grid);
-  const start=rdListPage*RD_PAGE_SIZE;
-  const pageItems=rdItems.slice(start,start+RD_PAGE_SIZE);
-  grid.innerHTML=pageItems.map((it,i)=>{
-    const idx=start+i;
+  const items=(rdRenderMeta&&rdRenderMeta.items)||[];
+  const start=(rdRenderMeta&&rdRenderMeta.page||0)*RD_PAGE_SIZE;
+  rdItems=items;
+  grid.innerHTML=items.map((it,i)=>{
+    it._ui=i;
     const sub=it.page_count?('共 '+it.page_count+' 页'):'页数未知';
     const date=it.year?((it.year||'')+'-'+String(it.month||0).padStart(2,'0')+'-'+String(it.day||0).padStart(2,'0')):'';
     return '<div class="rd-card">'+
-      '<img class="rd-thumb" style="cursor:pointer" onclick="rdOpen('+idx+')" loading="lazy" alt="" data-name="'+esc(it.open_name||it.name)+'" data-size="'+it.size+'"'+rdSrcAttr(prevSrc,it.open_name||it.name)+'>' +
-      '<div class="rd-meta rd-meta-btn" onclick="rdShowDetail('+idx+')" title="查看元数据并筛选">'+
+      '<img class="rd-thumb" style="cursor:pointer" onclick="rdOpen('+i+')" loading="lazy" alt="" data-name="'+esc(it.open_name||it.name)+'" data-size="'+it.size+'"'+rdSrcAttr(prevSrc,it.open_name||it.name)+'>'+
+      '<div class="rd-meta rd-meta-btn" onclick="rdShowDetail('+i+')" title="查看元数据并筛选">'+
       '<div class="rd-name">'+esc(it.title_original||it.title||it.name)+'</div>'+
       '<div class="rd-meta-row"><span>'+esc(sub)+'</span><span class="rd-date">'+esc(date)+'</span></div></div></div>';
   }).join('')||'<div class="rd-loading">没有符合条件的漫画</div>';
   rdFillThumbs(grid);
-  rdPager(Math.ceil(rdItems.length/RD_PAGE_SIZE),
-    '共 '+rdItems.length+' 本 (目录里 '+rdDirTotal+' 本)');
+  const pages=(rdRenderMeta&&rdRenderMeta.pages)||1;
+  rdPager(pages,'共 '+((rdRenderMeta&&rdRenderMeta.total)||0)+' 本 (目录里 '+rdDirTotal+' 本)');
 }
 function rdOpen(i){
   rdView=rdItems[i];
@@ -3849,6 +4166,8 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as ex:
                     fail += 1
                     results.append((full, "fail", str(ex)[:200]))
+            if ok:
+                invalidate_reader_snapshot()
             write_op_log("确认删除上传重复文件", {"ok": ok, "fail": fail,
                                           "paths": paths})
             self._json({"ok": ok, "fail": fail, "results": results})
@@ -3886,6 +4205,8 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as ex:
                     fail += 1
                     results.append((full, "fail", str(ex)[:200]))
+            if ok:
+                invalidate_reader_snapshot()
             write_op_log("确认删除重复文件", {"ok": ok, "fail": fail,
                                        "paths": paths})
             self._json({"ok": ok, "fail": fail, "results": results})
@@ -3928,6 +4249,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json(API.filter_preview(conditions, join, base_dir,
                                           group_by, src_dir, recursive,
                                           group_dir=group_dir))
+            return
+        if path == "/api/reader/view":
+            self._json(API.reader_view(
+                body.get("src_dir", ""), body.get("conditions", []),
+                body.get("join", "and"), bool(body.get("subdirs", False)),
+                bool(body.get("force", False)), body.get("view", "grid"),
+                body.get("sort", "date"), body.get("order", "desc"),
+                body.get("page", 0), body.get("expanded", []),
+                body.get("group_pages", {})))
             return
         if path == "/api/reader/list":
             self._json(API.reader_list(body.get("src_dir", ""),
